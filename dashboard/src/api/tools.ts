@@ -1,0 +1,376 @@
+/**
+ * Tools API service
+ */
+
+import { api } from "./client";
+import type { Tool } from "@/types/tool";
+import type { GenerateSchemaRequest } from "@/generated/types/generateSchemaRequest";
+import type {
+  ToolPreviewResponse as GeneratedToolPreviewResponse,
+  ToolPreviewTarget as GeneratedToolPreviewTarget,
+  ToolPreviewWarning as GeneratedToolPreviewWarning,
+} from "@/generated/types";
+
+/**
+ * Request body for {@link toolsApi.generateSchemasFromOpenapi}.
+ *
+ * Re-exported from the generated OpenAPI client so the shape stays in lockstep
+ * with the backend contract (`url`, optional `request_type`, optional
+ * `openapi_url`).
+ */
+export type GenerateSchemasFromOpenapiInput = GenerateSchemaRequest;
+
+/**
+ * Response from `POST /v1/tools/generate-schemas-from-openapi`.
+ *
+ * The endpoint returns an untyped `JSONResponse` on the backend, so orval
+ * generates only `data: unknown` for it; this narrows that shape by hand.
+ */
+export interface GenerateSchemasFromOpenapiResult {
+  message: string;
+  success: boolean;
+  input_schema: Record<string, unknown> | null;
+  output_schema: Record<string, unknown> | null;
+  spec_url: string;
+  /** Set by the backend when the spec host requires authentication. */
+  requires_auth?: boolean;
+}
+
+export interface ToolPreviewRequest {
+  arguments: Record<string, unknown>;
+  server_id?: string;
+}
+
+export type ToolPreviewWarning = GeneratedToolPreviewWarning;
+export type ToolPreviewTarget = GeneratedToolPreviewTarget;
+export type ToolPreviewResponse = GeneratedToolPreviewResponse;
+
+export interface ToolPreviewResult {
+  preview: ToolPreviewResponse;
+  status: number;
+}
+
+/**
+ * A single content block from an MCP `tools/call` result (text, image, blob, or
+ * embedded resource). Hand-typed rather than generated: JSON-RPC methods like
+ * `tools/call` live outside the REST surface orval generates types from, and MCP
+ * servers vary in which key spellings they emit (`mimeType` vs `mime_type`, etc.),
+ * hence the index signature.
+ */
+export interface ToolResultResource {
+  uri?: string;
+  mimeType?: string;
+  mime_type?: string;
+  text?: string;
+  blob?: string;
+  data?: string;
+  [key: string]: unknown;
+}
+
+export interface ToolResultContentBlock {
+  type?: string;
+  text?: string;
+  data?: string;
+  blob?: string;
+  mimeType?: string;
+  mime_type?: string;
+  uri?: string;
+  resource?: ToolResultResource;
+  [key: string]: unknown;
+}
+
+/**
+ * Result of an MCP `tools/call` JSON-RPC request. Hand-typed for the same reason
+ * as {@link ToolResultContentBlock} above: this isn't part of the OpenAPI surface,
+ * and MCP servers may nest the payload under alternate keys (`tool_result`,
+ * `toolResult`, `output`) or use snake_case field variants.
+ */
+export interface ToolInvokeResultPayload {
+  content?: unknown[];
+  structuredOutput?: unknown;
+  structured_output?: unknown;
+  isError?: boolean;
+  is_error?: boolean;
+  [key: string]: unknown;
+}
+
+export type ToolInvokeRequestId = string | number;
+
+export interface ToolInvokeRequest {
+  jsonrpc: "2.0";
+  id: ToolInvokeRequestId;
+  method: "tools/call";
+  params: {
+    name: string;
+    server_id?: string;
+    arguments: Record<string, unknown>;
+  };
+}
+
+export interface ToolCancelInvokeRequest {
+  jsonrpc: "2.0";
+  id: ToolInvokeRequestId;
+  method: "notifications/cancelled";
+  params: {
+    requestId: string;
+    reason?: string;
+  };
+}
+
+export interface ToolJsonRpcErrorBody {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+export interface ToolInvokeJsonRpcResponse {
+  jsonrpc?: "2.0";
+  id?: ToolInvokeRequestId | null;
+  result?: ToolInvokeResultPayload;
+  error?: ToolJsonRpcErrorBody;
+}
+
+export interface ToolInvokeResult {
+  result: ToolInvokeResultPayload;
+  status: number;
+  id: ToolInvokeRequestId | null;
+}
+
+export class ToolInvokeJsonRpcError extends Error {
+  constructor(
+    public readonly rpcError: ToolJsonRpcErrorBody,
+    public readonly status: number,
+    public readonly id: ToolInvokeRequestId | null,
+  ) {
+    super(rpcError.message);
+    this.name = "ToolInvokeJsonRpcError";
+  }
+}
+
+/**
+ * Validates tool ID to prevent path traversal and injection attacks
+ * @param id - The tool ID to validate
+ * @returns The validated ID
+ * @throws Error if ID is invalid
+ */
+function validateToolId(id: string): string {
+  if (!id || typeof id !== "string") {
+    throw new Error("Invalid tool ID");
+  }
+
+  // Ensure ID is alphanumeric with hyphens/underscores only
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    throw new Error("Invalid tool ID format");
+  }
+
+  return id;
+}
+
+// Mirrors the prompt preview name validator: tools are addressed by their MCP
+// name on preview/call surfaces, not by the database ID used by CRUD routes.
+const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_.\- ]+$/;
+
+function validateToolName(name: string): string {
+  if (!name || typeof name !== "string" || !name.trim()) {
+    throw new Error("Invalid tool name");
+  }
+  const trimmed = name.trim();
+  if (trimmed === "." || trimmed === "..") {
+    throw new Error("Invalid tool name format");
+  }
+  if (!TOOL_NAME_PATTERN.test(name)) {
+    throw new Error("Invalid tool name format");
+  }
+  return name;
+}
+
+function validateRequestId(id: ToolInvokeRequestId): ToolInvokeRequestId {
+  if (typeof id === "string" && id.trim()) return id;
+  if (typeof id === "number" && Number.isFinite(id)) return id;
+  throw new Error("Invalid request ID");
+}
+
+export const toolsApi = {
+  /**
+   * Fetch a single tool by ID.
+   *
+   * @param id - The tool ID
+   */
+  get: (id: string): Promise<Tool> => {
+    const validId = validateToolId(id);
+    return api.get<Tool>(`/tools/${validId}`);
+  },
+
+  /**
+   * Delete a tool
+   */
+  delete: (id: string): Promise<void> => {
+    const validId = validateToolId(id);
+    return api.delete(`/tools/${validId}`);
+  },
+
+  /**
+   * Replace a tool's tags.
+   *
+   * Sends a partial `PUT /tools/{id}` carrying only `tags`; the update service
+   * leaves every other field untouched when it is omitted. Returns the updated
+   * tool (with backend-normalized tag objects) so callers can patch their cache
+   * with the canonical values.
+   */
+  updateTags: (id: string, tags: string[]): Promise<Tool> => {
+    const validId = validateToolId(id);
+    return api.put<Tool>(`/tools/${validId}`, { tags });
+  },
+
+  // Activation uses the canonical `POST /tools/{tool_id}/state?activate=true|false`
+  // endpoint (requires `tools.update` permission). The deprecated `/toggle` endpoint
+  // is intentionally not used.
+
+  /**
+   * Activate a tool (take it back into routing/availability).
+   *
+   * @param id - The tool ID
+   */
+  activate: (id: string): Promise<void> => {
+    const validId = validateToolId(id);
+    return api.post(`/tools/${validId}/state?activate=true`);
+  },
+
+  /**
+   * Deactivate a tool (remove it from routing/availability).
+   *
+   * @param id - The tool ID
+   */
+  deactivate: (id: string): Promise<void> => {
+    const validId = validateToolId(id);
+    return api.post(`/tools/${validId}/state?activate=false`);
+  },
+
+  /**
+   * Dry-run a tool invocation without contacting federated upstream servers.
+   *
+   * Uses the MCP tool name as the wire identifier, matching snippet output and
+   * the future `Mcp-Name` routing header. This intentionally does not use
+   * `validateToolId`, because valid tool names may contain spaces and dots.
+   */
+  preview: (
+    name: string,
+    args: Record<string, unknown> = {},
+    passthroughHeaders: Record<string, string> = {},
+    options: { serverId?: string; signal?: AbortSignal } = {},
+  ): Promise<ToolPreviewResult> => {
+    const validName = validateToolName(name);
+    return api
+      .postWithMeta<ToolPreviewResponse>(
+        `/v1/tools/preview/${encodeURIComponent(validName)}`,
+        {
+          arguments: args,
+          // Backend acceptance and enforcement of this scope is tracked by
+          // IBM/mcp-context-forge#6743; the virtual-server UI stays flag-gated until then.
+          ...(options.serverId ? { server_id: options.serverId } : {}),
+        } satisfies ToolPreviewRequest,
+        { headers: passthroughHeaders, signal: options.signal },
+      )
+      .then(({ data, status }) => ({ preview: data, status }));
+  },
+
+  /**
+   * Invoke a tool through the production MCP JSON-RPC path.
+   *
+   * The browser calls `/rpc`; `api` resolves that to same-origin `/api/rpc`,
+   * where the BFF injects the upstream bearer token. JSON-RPC errors are body
+   * fields even when HTTP status is 200, so callers must not rely on HTTP
+   * status alone to classify invocation success.
+   */
+  invoke: (
+    name: string,
+    args: Record<string, unknown> = {},
+    passthroughHeaders: Record<string, string> = {},
+    options: { requestId?: ToolInvokeRequestId; serverId?: string; signal?: AbortSignal } = {},
+  ): Promise<ToolInvokeResult> => {
+    const validName = validateToolName(name);
+    const requestId = options.requestId ?? `tool-live-${Date.now()}`;
+    const body: ToolInvokeRequest = {
+      jsonrpc: "2.0",
+      id: requestId,
+      method: "tools/call",
+      params: {
+        name: validName,
+        ...(options.serverId ? { server_id: options.serverId } : {}),
+        arguments: args,
+      },
+    };
+
+    return api
+      .postWithMeta<ToolInvokeJsonRpcResponse>("/rpc", body, {
+        headers: passthroughHeaders,
+        signal: options.signal,
+      })
+      .then(({ data, status }) => {
+        const id = data.id ?? null;
+        if (data.error) {
+          throw new ToolInvokeJsonRpcError(data.error, status, id);
+        }
+        if (!data.result) {
+          throw new ToolInvokeJsonRpcError(
+            {
+              code: -32603,
+              message: "Malformed JSON-RPC response",
+              data,
+            },
+            status,
+            id,
+          );
+        }
+        return { result: data.result, status, id };
+      });
+  },
+
+  /**
+   * Request cancellation for an in-flight MCP JSON-RPC tool call.
+   *
+   * Uses the owner-authorized MCP notification path on `/rpc` instead of the
+   * REST cancellation endpoint, which is admin-scoped in the gateway today.
+   */
+  cancelInvoke: (
+    requestId: ToolInvokeRequestId,
+    reason?: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<void> => {
+    const validRequestId = validateRequestId(requestId);
+    const body: ToolCancelInvokeRequest = {
+      jsonrpc: "2.0",
+      id: `cancel-${String(validRequestId)}`,
+      method: "notifications/cancelled",
+      params: {
+        requestId: String(validRequestId),
+        ...(reason ? { reason } : {}),
+      },
+    };
+
+    return api
+      .postWithMeta<ToolInvokeJsonRpcResponse>("/rpc", body, { signal: options.signal })
+      .then(({ data, status }) => {
+        const id = data.id ?? null;
+        if (data.error) {
+          throw new ToolInvokeJsonRpcError(data.error, status, id);
+        }
+      });
+  },
+
+  /**
+   * Generate input/output JSON schemas for a REST tool from its OpenAPI spec.
+   *
+   * Delegates to `POST /v1/tools/generate-schemas-from-openapi`, which fetches
+   * the OpenAPI 3.x document for the tool host, resolves the requested
+   * path + method, and returns the extracted schemas plus the `spec_url` it used.
+   * Requires the `tools.create` permission. Rejects with an {@link ApiError}
+   * carrying the backend status code (400/404/502/500) on failure.
+   *
+   * @param input - Tool URL, HTTP method, and optional spec URL / auth
+   */
+  generateSchemasFromOpenapi: (
+    input: GenerateSchemasFromOpenapiInput,
+  ): Promise<GenerateSchemasFromOpenapiResult> =>
+    api.post<GenerateSchemasFromOpenapiResult>("/v1/tools/generate-schemas-from-openapi", input),
+};

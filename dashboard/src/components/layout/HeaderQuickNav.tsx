@@ -1,0 +1,540 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
+import { Command, Search, X } from "lucide-react";
+import { useIntl } from "react-intl";
+import { searchEntities } from "@/api/search";
+import type { GlobalSearchGroup, GlobalSearchItem, SearchEntityType } from "@/api/search";
+import { useAuthContext } from "@/auth/AuthContext";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+import { useRouter } from "@/router";
+import { Input } from "../ui/input";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Separator } from "@/components/ui/separator";
+import { TruncatedText } from "@/components/ui/truncated-text";
+import { TruncatedMiddleText } from "@/components/ui/truncated-middle-text";
+
+const SEARCH_DEBOUNCE_MS = 250;
+const MIN_QUERY_LENGTH = 2;
+const SEARCH_LIMIT_PER_TYPE = 8;
+
+const BASE_SEARCH_ENTITY_TYPES: SearchEntityType[] = [
+  "servers",
+  "gateways",
+  "tools",
+  "resources",
+  "prompts",
+  "agents",
+  "teams",
+  "catalog",
+];
+
+const ENTITY_ROUTE: Record<SearchEntityType, string> = {
+  servers: "/app/gateways",
+  gateways: "/app/servers",
+  tools: "/app/tools",
+  resources: "/app/resources",
+  prompts: "/app/prompts",
+  agents: "/app/agents",
+  teams: "/app/settings/teams",
+  users: "/app/settings/users",
+  catalog: "/app/server-catalog",
+};
+
+const ENTITY_LABEL_KEY: Record<SearchEntityType, string> = {
+  servers: "navigation.virtualServers",
+  gateways: "navigation.servers",
+  tools: "navigation.tools",
+  resources: "navigation.resources",
+  prompts: "navigation.prompts",
+  agents: "navigation.agents",
+  teams: "navigation.teams",
+  users: "navigation.users",
+  catalog: "navigation.serverCatalog",
+};
+
+type SearchStatus = "idle" | "loading" | "success" | "error";
+
+interface VisibleSearchItem {
+  id: string;
+  name: string;
+  summary: string;
+  summaryIsUrl: boolean;
+}
+
+interface VisibleSearchGroup {
+  entity_type: SearchEntityType;
+  items: VisibleSearchItem[];
+}
+
+interface VisibleSearchResult {
+  entityType: SearchEntityType;
+  item: VisibleSearchItem;
+}
+
+type ShortcutNavigator = Pick<Navigator, "platform" | "userAgent"> & {
+  userAgentData?: {
+    platform?: string;
+  };
+};
+
+export function isAppleShortcutPlatform(nav: ShortcutNavigator = navigator) {
+  const detectedPlatform = [nav.userAgentData?.platform, nav.platform, nav.userAgent]
+    .filter(Boolean)
+    .join(" ");
+
+  return /mac|iphone|ipad|ipod/i.test(detectedPlatform);
+}
+
+function getString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function getItemId(item: GlobalSearchItem): string {
+  return (
+    getString(item.id) ||
+    getString(item.email) ||
+    getString(item.slug) ||
+    getString(item.uri) ||
+    getString(item.name)
+  );
+}
+
+function getItemName(item: GlobalSearchItem): string {
+  return (
+    getString(item.display_name) ||
+    getString(item.displayName) ||
+    getString(item.original_name) ||
+    getString(item.originalName) ||
+    getString(item.name) ||
+    getString(item.full_name) ||
+    getString(item.email) ||
+    getString(item.slug) ||
+    getString(item.id) ||
+    getString(item.uri)
+  );
+}
+
+function getItemSummary(item: GlobalSearchItem): { value: string; isUrlLike: boolean } {
+  const prose = getString(item.description) || getString(item.email) || getString(item.slug);
+  if (prose) return { value: prose, isUrlLike: false };
+
+  const urlLike = getString(item.url) || getString(item.endpoint_url) || getString(item.uri);
+  if (urlLike) return { value: urlLike, isUrlLike: true };
+
+  return { value: getString(item.original_name) || getString(item.id), isUrlLike: false };
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+export function HeaderQuickNav() {
+  const intl = useIntl();
+  const { navigate } = useRouter();
+  const { selectedTeamId, user } = useAuthContext();
+  const [query, setQuery] = useState("");
+  const [isApplePlatform, setIsApplePlatform] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false);
+  const [status, setStatus] = useState<SearchStatus>("idle");
+  const [groups, setGroups] = useState<GlobalSearchGroup[]>([]);
+  const [focusedResultIndex, setFocusedResultIndex] = useState(-1);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const trimmedQuery = query.trim();
+  const isPlatformAdmin = Boolean(user?.is_admin);
+  const searchEntityTypes = useMemo<SearchEntityType[]>(
+    () => (isPlatformAdmin ? [...BASE_SEARCH_ENTITY_TYPES, "users"] : BASE_SEARCH_ENTITY_TYPES),
+    [isPlatformAdmin],
+  );
+  const visibleGroups = useMemo<VisibleSearchGroup[]>(
+    () =>
+      groups
+        .map((group) => ({
+          entity_type: group.entity_type,
+          items: group.items
+            .map((item) => {
+              const summary = getItemSummary(item);
+              return {
+                id: getItemId(item),
+                name: getItemName(item),
+                summary: summary.value,
+                summaryIsUrl: summary.isUrlLike,
+              };
+            })
+            .filter((item) => item.id && item.name),
+        }))
+        .filter((group) => group.items.length > 0),
+    [groups],
+  );
+  const hasResults = visibleGroups.length > 0;
+  const visibleResults = useMemo<VisibleSearchResult[]>(
+    () =>
+      visibleGroups.flatMap((group) =>
+        group.items.map((item) => ({
+          entityType: group.entity_type,
+          item,
+        })),
+      ),
+    [visibleGroups],
+  );
+  const activeResultId =
+    focusedResultIndex >= 0 && focusedResultIndex < visibleResults.length
+      ? `quick-nav-result-${focusedResultIndex}`
+      : undefined;
+  // Requiring a query keeps the dropdown from opening over the input's expand animation,
+  // which starts on the same focus event.
+  const isResultsOpen = isPopoverOpen && query.length > 0;
+  // Mirrors the dropdown's visible state into one region that stays mounted, since screen
+  // readers announce text changes far more reliably than a live region that mounts with content.
+  const announcedStatus = useMemo(() => {
+    if (query.length === 0) return "";
+    if (trimmedQuery.length < MIN_QUERY_LENGTH) {
+      return intl.formatMessage({ id: "common.search.startTyping" }, { count: MIN_QUERY_LENGTH });
+    }
+    if (status === "loading") return intl.formatMessage({ id: "common.search.searching" });
+    if (status === "error") return intl.formatMessage({ id: "common.search.error" });
+    if (status === "success") {
+      return hasResults
+        ? intl.formatMessage({ id: "common.search.resultCount" }, { count: visibleResults.length })
+        : intl.formatMessage({ id: "common.search.noResults" });
+    }
+    return "";
+  }, [query.length, trimmedQuery.length, status, hasResults, visibleResults.length, intl]);
+
+  const focusSearchInput = useCallback((select = false) => {
+    setIsExpanded(true);
+    setIsPopoverOpen(true);
+    window.setTimeout(() => {
+      inputRef.current?.focus();
+      if (select) {
+        inputRef.current?.select();
+      }
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    setIsApplePlatform(isAppleShortcutPlatform());
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
+      ) {
+        return;
+      }
+
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        focusSearchInput(true);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [focusSearchInput]);
+
+  useEffect(() => {
+    setFocusedResultIndex(-1);
+  }, [trimmedQuery, visibleResults.length]);
+
+  useEffect(() => {
+    if (trimmedQuery.length < MIN_QUERY_LENGTH) {
+      setStatus("idle");
+      setGroups([]);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      setStatus("loading");
+      searchEntities({
+        query: trimmedQuery,
+        entityTypes: searchEntityTypes,
+        limitPerType: SEARCH_LIMIT_PER_TYPE,
+        teamId: selectedTeamId,
+        signal: controller.signal,
+      })
+        .then((payload) => {
+          setGroups(Array.isArray(payload.groups) ? payload.groups : []);
+          setStatus("success");
+        })
+        .catch((error) => {
+          if (isAbortError(error)) return;
+          setGroups([]);
+          setStatus("error");
+        });
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [trimmedQuery, searchEntityTypes, selectedTeamId]);
+
+  const buildDestination = useCallback(
+    (entityType: SearchEntityType, item: VisibleSearchItem) => {
+      const params = new URLSearchParams();
+      params.set("selected", item.id);
+      params.set("search", trimmedQuery);
+      return `${ENTITY_ROUTE[entityType]}?${params.toString()}`;
+    },
+    [trimmedQuery],
+  );
+
+  const handleResultSelect = useCallback(
+    (entityType: SearchEntityType, item: VisibleSearchItem) => {
+      navigate(buildDestination(entityType, item));
+      setIsPopoverOpen(false);
+      setIsExpanded(query.length > 0);
+    },
+    [buildDestination, navigate, query.length],
+  );
+
+  const firstResult = visibleGroups[0]?.items[0];
+  const firstResultEntity = visibleGroups[0]?.entity_type;
+
+  const handleSearchKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Escape") {
+      setIsPopoverOpen(false);
+      setFocusedResultIndex(-1);
+      return;
+    }
+
+    if (visibleResults.length === 0) return;
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setIsPopoverOpen(true);
+      setFocusedResultIndex((prev) => Math.min(prev + 1, visibleResults.length - 1));
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setIsPopoverOpen(true);
+      setFocusedResultIndex((prev) => Math.max(prev - 1, 0));
+      return;
+    }
+
+    if (event.key === "Enter" && focusedResultIndex >= 0) {
+      const focusedResult = visibleResults[focusedResultIndex];
+      if (focusedResult) {
+        event.preventDefault();
+        handleResultSelect(focusedResult.entityType, focusedResult.item);
+      }
+    }
+  };
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (firstResult && firstResultEntity) {
+      handleResultSelect(firstResultEntity, firstResult);
+    }
+  };
+
+  const handleClear = () => {
+    setQuery("");
+    focusSearchInput();
+  };
+
+  const renderSearchContent = () => {
+    if (trimmedQuery.length < MIN_QUERY_LENGTH) {
+      return (
+        <p className="px-3 py-3 text-sm text-muted-foreground">
+          {intl.formatMessage({ id: "common.search.startTyping" }, { count: MIN_QUERY_LENGTH })}
+        </p>
+      );
+    }
+
+    if (status === "loading") {
+      return (
+        <p className="px-3 py-3 text-sm text-muted-foreground">
+          {intl.formatMessage({ id: "common.search.searching" })}
+        </p>
+      );
+    }
+
+    if (status === "error") {
+      return (
+        <p className="px-3 py-3 text-sm text-destructive">
+          {intl.formatMessage({ id: "common.search.error" })}
+        </p>
+      );
+    }
+
+    if (status === "success" && !hasResults) {
+      return (
+        <p className="px-3 py-3 text-sm text-muted-foreground">
+          {intl.formatMessage({ id: "common.search.noResults" })}
+        </p>
+      );
+    }
+
+    return visibleGroups.map((group, groupIndex) => (
+      <div key={group.entity_type}>
+        {groupIndex > 0 ? <Separator /> : null}
+        <div className="flex items-center justify-between px-3 py-2">
+          <span className="text-xs font-semibold uppercase text-muted-foreground">
+            {intl.formatMessage({ id: ENTITY_LABEL_KEY[group.entity_type] })}
+          </span>
+          <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+            {group.items.length}
+          </Badge>
+        </div>
+        <div className="pb-1">
+          {group.items.map((item) => {
+            const resultIndex = visibleResults.findIndex(
+              (result) => result.entityType === group.entity_type && result.item.id === item.id,
+            );
+            const isFocused = resultIndex === focusedResultIndex;
+
+            return (
+              <Button
+                id={`quick-nav-result-${resultIndex}`}
+                key={`${group.entity_type}-${item.id}`}
+                type="button"
+                variant="ghost"
+                role="option"
+                tabIndex={-1}
+                aria-selected={isFocused}
+                className={cn(
+                  "flex h-auto w-full flex-col items-start justify-center gap-0.5 px-3 py-2 text-left whitespace-normal transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
+                  isFocused ? "bg-muted" : "",
+                )}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleResultSelect(group.entity_type, item)}
+              >
+                <TruncatedText className="w-full text-sm font-medium text-foreground">
+                  {item.name}
+                </TruncatedText>
+                {item.summary && item.summary !== item.name ? (
+                  item.summaryIsUrl ? (
+                    <TruncatedMiddleText
+                      value={item.summary}
+                      maxLength={40}
+                      className="w-full text-xs text-muted-foreground"
+                    />
+                  ) : (
+                    <TruncatedText className="w-full text-xs text-muted-foreground">
+                      {item.summary}
+                    </TruncatedText>
+                  )
+                ) : null}
+              </Button>
+            );
+          })}
+        </div>
+      </div>
+    ));
+  };
+
+  return (
+    <div className="mr-3">
+      <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcedStatus}
+      </p>
+      <Popover open={isResultsOpen} onOpenChange={setIsPopoverOpen}>
+        <form onSubmit={handleSubmit} className="flex items-center">
+          <PopoverTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => focusSearchInput()}
+              className="rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              aria-label={intl.formatMessage({ id: "common.search" })}
+              title={intl.formatMessage({ id: "common.search" })}
+            >
+              <Search className="size-4" aria-hidden="true" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverAnchor asChild>
+            <div
+              className={cn(
+                "relative flex items-center transition-[margin] duration-200 ease-out",
+                isExpanded || query.length > 0 ? "ml-1.5" : "ml-0",
+              )}
+            >
+              <Input
+                ref={inputRef}
+                type="search"
+                value={query}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  setIsPopoverOpen(true);
+                }}
+                onKeyDown={handleSearchKeyDown}
+                onFocus={() => {
+                  setIsExpanded(true);
+                  setIsPopoverOpen(true);
+                }}
+                onBlur={() => setIsExpanded(query.length > 0)}
+                aria-label={intl.formatMessage({ id: "common.search" })}
+                aria-controls="quick-nav-results"
+                aria-activedescendant={activeResultId}
+                aria-expanded={isResultsOpen}
+                data-expanded={isExpanded}
+                autoComplete="off"
+                placeholder={
+                  isExpanded || query.length > 0 ? intl.formatMessage({ id: "common.search" }) : ""
+                }
+                className={cn(
+                  "h-8 rounded-lg border-border bg-muted/50 text-sm shadow-none transition-[width,padding,color,background-color,border-color] duration-200 ease-out [&::-webkit-search-cancel-button]:appearance-none placeholder:text-muted-foreground/80 focus-visible:bg-background",
+                  isExpanded || query.length > 0
+                    ? "w-44 max-w-[50vw] pl-3 pr-8 text-foreground md:w-75 md:max-w-none lg:w-100"
+                    : "w-0 overflow-hidden border-0 bg-transparent px-0 text-transparent caret-foreground",
+                )}
+              />
+              {query.length > 0 && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={handleClear}
+                  aria-label={intl.formatMessage({ id: "common.search.clear" })}
+                  className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <X className="size-3.5" />
+                </Button>
+              )}
+            </div>
+          </PopoverAnchor>
+          {isExpanded || query.length > 0 ? null : (
+            <span
+              aria-hidden="true"
+              // -ml-0.5 trims the icon button's padding down to the 6px gap the design specifies.
+              className={cn(
+                "pointer-events-none -ml-0.5 hidden h-5 items-center justify-center gap-1 rounded bg-muted text-[13px] leading-4 text-muted-foreground/80 md:flex",
+                isApplePlatform ? "w-[30px]" : "px-1.5",
+              )}
+            >
+              {isApplePlatform ? <Command className="size-3" /> : <span>Ctrl</span>}
+              <span>k</span>
+            </span>
+          )}
+        </form>
+        <PopoverContent
+          align="start"
+          className="w-75 max-w-[calc(100vw-2rem)] p-0 lg:w-100"
+          onOpenAutoFocus={(event) => event.preventDefault()}
+        >
+          <div
+            id="quick-nav-results"
+            role="listbox"
+            aria-label={intl.formatMessage({ id: "common.search.results" })}
+          >
+            {renderSearchContent()}
+          </div>
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
+}

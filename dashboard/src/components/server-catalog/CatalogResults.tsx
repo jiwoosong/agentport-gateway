@@ -1,0 +1,551 @@
+import { useEffect, useId, useRef } from "react";
+import type { ReactNode } from "react";
+import { EllipsisVertical, FileText, KeyRound, Lock, Plus } from "lucide-react";
+import { useIntl } from "react-intl";
+import { STATUS_ICON, STATUS_TONE_CLASS } from "@/lib/status";
+import { isRetryableOAuthStatus, type OAuthStatusEntry } from "@/api/oauth";
+
+import { EmptyStatePlaceholder } from "@/components/dashboard/EmptyStatePlaceholder";
+import { CatalogLogo } from "@/components/server-catalog/CatalogLogo";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { CardTag } from "@/components/ui/card-tag";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { StatusIndicator } from "@/components/ui/status-indicator";
+import type { CatalogServer } from "@/generated/types";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import {
+  getAuthTypeGroupId,
+  getAuthTypeGroupLabelId,
+  isCatalogOAuthServer,
+} from "@/utils/catalogAuthTypes";
+import { getTagLabels } from "@/utils/tags";
+
+const EMPTY_PENDING_IDS: ReadonlySet<string> = new Set();
+const EMPTY_OAUTH_STATUSES: Readonly<Record<string, OAuthStatusEntry>> = {};
+const EMPTY_ADD_ERRORS: Readonly<Record<string, string>> = {};
+
+function getOAuthCardState(server: CatalogServer, entry?: OAuthStatusEntry) {
+  if (!isCatalogOAuthServer(server))
+    return {
+      messageId: "mcpServer.catalog.connected",
+      severity: "success" as const,
+      canAuthorize: false,
+      canRetry: false,
+    };
+  if (!entry || entry.state === "unavailable")
+    return {
+      messageId: "mcpServer.catalog.oauth.statusUnavailable",
+      severity: "warning" as const,
+      canAuthorize: false,
+      canRetry: isRetryableOAuthStatus(entry),
+    };
+  if (entry.state === "loading")
+    return {
+      messageId: "mcpServer.catalog.oauth.statusChecking",
+      severity: "info" as const,
+      canAuthorize: false,
+      canRetry: false,
+    };
+  if (entry.state === "not_applicable")
+    return {
+      messageId: "mcpServer.catalog.connected",
+      severity: "success" as const,
+      canAuthorize: false,
+      canRetry: false,
+    };
+
+  const tokenState = entry.tokenStatus;
+  if (tokenState === "valid")
+    return {
+      messageId: "mcpServer.catalog.connected",
+      severity: "success" as const,
+      canAuthorize: false,
+      canRetry: false,
+    };
+  if (tokenState === "near_expiry")
+    return {
+      messageId: "mcpServer.catalog.oauth.nearExpiry",
+      severity: "warning" as const,
+      canAuthorize: false,
+      canRetry: false,
+    };
+  if (tokenState === "expired")
+    return {
+      messageId: "mcpServer.catalog.oauth.expired",
+      severity: "error" as const,
+      canAuthorize: true,
+      canRetry: false,
+    };
+  if (tokenState === "missing")
+    return {
+      messageId: "mcpServer.catalog.oauth.needsAuthorization",
+      severity: "info" as const,
+      canAuthorize: true,
+      canRetry: false,
+    };
+  return {
+    messageId: "mcpServer.catalog.oauth.statusUnavailable",
+    severity: "warning" as const,
+    canAuthorize: false,
+    canRetry: true,
+  };
+}
+
+function isOAuthCardUsable(server: CatalogServer, entry?: OAuthStatusEntry): boolean {
+  if (!isCatalogOAuthServer(server)) return true;
+  if (entry?.state === "not_applicable") return true;
+  return (
+    entry?.state === "ready" &&
+    (entry.tokenStatus === "valid" || entry.tokenStatus === "near_expiry")
+  );
+}
+
+function CatalogCard({
+  server,
+  onView,
+  onAdd,
+  onTest,
+  onAuthorize,
+  onDisconnect,
+  isAdding,
+  isTesting,
+  isDisconnecting,
+  canTest,
+  canDisconnect,
+  oauthStatuses,
+  addError,
+  onAddErrorRead,
+  onRetryOAuthStatus,
+}: {
+  server: CatalogServer;
+  onView: (trigger: HTMLElement) => void;
+  onAdd: () => void;
+  onTest: () => void;
+  onAuthorize: () => void;
+  onDisconnect: () => void;
+  isAdding: boolean;
+  isTesting: boolean;
+  isDisconnecting: boolean;
+  canTest: boolean;
+  canDisconnect: boolean;
+  oauthStatuses?: Readonly<Record<string, OAuthStatusEntry>>;
+  /** Why the last add attempt failed, resolved to the server's reason or the fallback. */
+  addError?: string;
+  /** Called once the reason has been read, which is what retires the error. */
+  onAddErrorRead?: () => void;
+  onRetryOAuthStatus: (gatewayId: string) => void;
+}) {
+  const intl = useIntl();
+  const headingId = useId();
+  const addTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const actionsTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const pendingDetailsTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const shouldTransferAddFocusRef = useRef(false);
+  const shouldRestoreErrorFocusRef = useRef(false);
+  const oauthState = getOAuthCardState(
+    server,
+    server.gateway_id ? oauthStatuses?.[server.gateway_id] : undefined,
+  );
+  const oauthUsable = isOAuthCardUsable(
+    server,
+    server.gateway_id ? oauthStatuses?.[server.gateway_id] : undefined,
+  );
+  const authTypeGroupId = getAuthTypeGroupId(server.auth_type);
+  const requiresAuthentication = authTypeGroupId === "apiKey" || authTypeGroupId === "oauth";
+  const StatusIcon = STATUS_ICON[oauthState.severity];
+
+  useEffect(() => {
+    if (server.is_registered && shouldTransferAddFocusRef.current) {
+      shouldTransferAddFocusRef.current = false;
+      actionsTriggerRef.current?.focus();
+      return;
+    }
+
+    if (!server.is_registered && !isAdding) {
+      shouldTransferAddFocusRef.current = false;
+    }
+  }, [isAdding, server.is_registered]);
+
+  // Retiring the error unmounts the trigger the popover returns focus to.
+  useEffect(() => {
+    if (addError || !shouldRestoreErrorFocusRef.current) return;
+    shouldRestoreErrorFocusRef.current = false;
+
+    const timeoutId = window.setTimeout(() => {
+      const trigger = addTriggerRef.current;
+      if (!trigger) return;
+      const { activeElement, body } = trigger.ownerDocument;
+      if (activeElement === null || activeElement === body) trigger.focus();
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [addError]);
+
+  return (
+    <li className="min-w-0">
+      <Card className="h-full min-h-[200px] gap-0 rounded-xl border border-border bg-card p-0 py-0 shadow-none ring-0 transition-colors hover:border-ring dark:hover:border-muted-foreground">
+        <article className="flex h-full flex-col" aria-labelledby={headingId}>
+          <CardContent className="flex flex-1 flex-col px-5 py-5">
+            <div className="flex items-start justify-between gap-3">
+              <CatalogLogo server={server} />
+              {server.is_registered ? (
+                <span
+                  role="img"
+                  aria-label={intl.formatMessage({ id: "mcpServer.catalog.authenticated" })}
+                  title={intl.formatMessage({ id: "mcpServer.catalog.authenticated" })}
+                  className="inline-flex size-5 items-center justify-center rounded-sm bg-muted text-muted-foreground"
+                >
+                  <Lock className="size-3" aria-hidden="true" />
+                </span>
+              ) : requiresAuthentication ? (
+                <span className="inline-flex items-center gap-2 rounded-sm bg-muted p-1 text-[10px] font-medium leading-[14px] text-foreground">
+                  <KeyRound className="size-3" aria-hidden="true" />
+                  {intl.formatMessage({ id: "mcpServer.catalog.authRequired" })}
+                </span>
+              ) : null}
+            </div>
+
+            <h2 id={headingId} className="mt-4 truncate text-sm font-medium text-foreground">
+              {server.name}
+            </h2>
+            <p className="mt-3 line-clamp-2 min-h-10 text-sm text-muted-foreground">
+              {server.description}
+            </p>
+
+            <div className="mt-auto flex min-h-6 items-center gap-3 pt-4">
+              {server.is_registered ? (
+                <>
+                  {isDisconnecting ? (
+                    <span role="status" className="text-sm font-medium text-muted-foreground">
+                      {intl.formatMessage({ id: "mcpServer.catalog.disconnecting" })}
+                    </span>
+                  ) : isTesting ? (
+                    <span role="status" className="text-sm font-medium text-muted-foreground">
+                      {intl.formatMessage({ id: "mcpServer.catalog.testing" })}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-foreground">
+                      <StatusIcon
+                        className={`size-4 ${STATUS_TONE_CLASS[oauthState.severity]}`}
+                        aria-hidden="true"
+                      />
+                      {intl.formatMessage({ id: oauthState.messageId })}
+                    </span>
+                  )}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        ref={actionsTriggerRef}
+                        id={`catalog-server-actions-${server.id}`}
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={intl.formatMessage(
+                          { id: "mcpServer.catalog.actionsFor" },
+                          { name: server.name },
+                        )}
+                      >
+                        <EllipsisVertical className="size-4" aria-hidden="true" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="end"
+                      onCloseAutoFocus={(event) => {
+                        const trigger = pendingDetailsTriggerRef.current;
+                        if (!trigger) return;
+                        event.preventDefault();
+                        pendingDetailsTriggerRef.current = null;
+                        window.setTimeout(() => onView(trigger), 0);
+                      }}
+                    >
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          if (!actionsTriggerRef.current) return;
+                          pendingDetailsTriggerRef.current = actionsTriggerRef.current;
+                        }}
+                      >
+                        {intl.formatMessage({ id: "mcpServer.catalog.viewDetails" })}
+                      </DropdownMenuItem>
+                      {canTest && (
+                        <DropdownMenuItem
+                          disabled={!oauthUsable || isAdding || isTesting || isDisconnecting}
+                          onSelect={onTest}
+                          title={
+                            !oauthUsable
+                              ? intl.formatMessage({ id: "mcpServer.catalog.testOAuthPending" })
+                              : undefined
+                          }
+                        >
+                          {intl.formatMessage({ id: "mcpServer.catalog.test" })}
+                        </DropdownMenuItem>
+                      )}
+                      {oauthState.canAuthorize && server.gateway_id && (
+                        <DropdownMenuItem
+                          disabled={isAdding || isDisconnecting}
+                          onSelect={onAuthorize}
+                        >
+                          {intl.formatMessage({ id: "mcpServer.catalog.oauth.authorize" })}
+                        </DropdownMenuItem>
+                      )}
+                      {oauthState.canRetry && server.gateway_id && (
+                        <DropdownMenuItem
+                          disabled={isAdding || isDisconnecting}
+                          onSelect={() => onRetryOAuthStatus(server.gateway_id!)}
+                        >
+                          {intl.formatMessage({ id: "mcpServer.catalog.oauth.retryStatus" })}
+                        </DropdownMenuItem>
+                      )}
+                      {canDisconnect && server.gateway_id && (
+                        <DropdownMenuItem
+                          disabled={isAdding || isTesting || isDisconnecting}
+                          onSelect={onDisconnect}
+                        >
+                          {intl.formatMessage({ id: "mcpServer.catalog.disconnect" })}
+                        </DropdownMenuItem>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </>
+              ) : (
+                <Button
+                  ref={addTriggerRef}
+                  id={`catalog-server-add-${server.id}`}
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={isAdding}
+                  aria-label={intl.formatMessage(
+                    {
+                      id: isAdding
+                        ? "mcpServer.catalog.addingServer"
+                        : "mcpServer.catalog.addServer",
+                    },
+                    { name: server.name },
+                  )}
+                  onClick={() => {
+                    shouldTransferAddFocusRef.current =
+                      addTriggerRef.current?.ownerDocument.activeElement === addTriggerRef.current;
+                    onAdd();
+                  }}
+                >
+                  <Plus className="size-3.5" aria-hidden="true" />
+                  {isAdding
+                    ? intl.formatMessage({ id: "mcpServer.catalog.adding" })
+                    : intl.formatMessage({ id: "mcpServer.catalog.add" })}
+                </Button>
+              )}
+
+              {!server.is_registered && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={intl.formatMessage(
+                    { id: "mcpServer.catalog.viewServer" },
+                    { name: server.name },
+                  )}
+                  onClick={(event) => onView(event.currentTarget)}
+                >
+                  <FileText className="size-4 text-muted-foreground" aria-hidden="true" />
+                </Button>
+              )}
+
+              {!server.is_registered && addError && !isAdding && (
+                <StatusIndicator
+                  Icon={STATUS_ICON.error}
+                  iconClassName={STATUS_TONE_CLASS.error}
+                  labelClassName="text-foreground"
+                  className="ml-2"
+                  label={intl.formatMessage({ id: "mcpServer.catalog.addFailed.short" })}
+                  fullLabel={intl.formatMessage({ id: "mcpServer.catalog.addFailed.label" })}
+                  triggerAriaLabel={intl.formatMessage(
+                    { id: "mcpServer.catalog.addFailed.trigger" },
+                    { name: server.name },
+                  )}
+                  contentAriaLabel={intl.formatMessage(
+                    { id: "mcpServer.catalog.addFailed.detail" },
+                    { name: server.name },
+                  )}
+                  onOpenChange={(open) => {
+                    if (open) return;
+                    shouldRestoreErrorFocusRef.current = true;
+                    onAddErrorRead?.();
+                  }}
+                >
+                  <p className="break-words text-sm text-foreground">{addError}</p>
+                </StatusIndicator>
+              )}
+            </div>
+          </CardContent>
+        </article>
+      </Card>
+    </li>
+  );
+}
+
+function DetailRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="contents">
+      <dt className="font-medium text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words text-foreground">{children}</dd>
+    </div>
+  );
+}
+
+export function CatalogServerDetailsDialog({
+  server,
+  oauthStatus,
+  onOpenChange,
+}: {
+  server: CatalogServer | null;
+  oauthStatus?: OAuthStatusEntry;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const intl = useIntl();
+  const tagsHeadingId = useId();
+  const tagLabels = getTagLabels(server?.tags ?? []);
+  const authTypeLabelId = server ? getAuthTypeGroupLabelId(server.auth_type) : null;
+  const registeredStatus = server ? getOAuthCardState(server, oauthStatus) : null;
+
+  return (
+    <Dialog open={server !== null} onOpenChange={onOpenChange}>
+      {server && (
+        <DialogContent>
+          <DialogHeader>
+            <div className="mb-2 flex items-center gap-3">
+              <CatalogLogo server={server} />
+              <DialogTitle>{server.name}</DialogTitle>
+            </div>
+            <DialogDescription>{server.description}</DialogDescription>
+          </DialogHeader>
+
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-6 gap-y-3 text-sm">
+            <DetailRow label={intl.formatMessage({ id: "mcpServer.catalog.provider" })}>
+              {server.provider}
+            </DetailRow>
+            <DetailRow label={intl.formatMessage({ id: "mcpServer.catalog.category" })}>
+              {server.category}
+            </DetailRow>
+            <DetailRow label={intl.formatMessage({ id: "mcpServer.catalog.authentication" })}>
+              {authTypeLabelId ? intl.formatMessage({ id: authTypeLabelId }) : server.auth_type}
+            </DetailRow>
+            {server.transport && (
+              <DetailRow label={intl.formatMessage({ id: "mcpServer.catalog.transport" })}>
+                {server.transport}
+              </DetailRow>
+            )}
+            <DetailRow label={intl.formatMessage({ id: "mcpServer.catalog.status" })}>
+              {server.is_registered
+                ? intl.formatMessage({ id: registeredStatus!.messageId })
+                : intl.formatMessage({ id: "mcpServer.catalog.notConnected" })}
+            </DetailRow>
+          </dl>
+
+          {tagLabels.length > 0 && (
+            <section aria-labelledby={tagsHeadingId}>
+              <h3 id={tagsHeadingId} className="mb-2 text-sm font-medium text-muted-foreground">
+                {intl.formatMessage({ id: "mcpServer.catalog.tags" })}
+              </h3>
+              <ul className="flex flex-wrap gap-2">
+                {tagLabels.map((tag) => (
+                  <li key={tag}>
+                    <CardTag variant="neutral">{tag}</CardTag>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </DialogContent>
+      )}
+    </Dialog>
+  );
+}
+
+export function CatalogResults({
+  servers,
+  emptyStateMessageId,
+  onView,
+  onAdd,
+  addingServerIds,
+  onTest,
+  onAuthorize,
+  onDisconnect,
+  testingServerIds = EMPTY_PENDING_IDS,
+  disconnectingServerIds = EMPTY_PENDING_IDS,
+  canTest,
+  canDisconnect,
+  oauthStatuses = EMPTY_OAUTH_STATUSES,
+  addErrors = EMPTY_ADD_ERRORS,
+  onAddErrorRead,
+  onRetryOAuthStatus = () => undefined,
+}: {
+  servers: CatalogServer[];
+  emptyStateMessageId: string;
+  onView: (server: CatalogServer, trigger: HTMLElement) => void;
+  onAdd: (server: CatalogServer) => void;
+  addingServerIds: ReadonlySet<string>;
+  onTest: (server: CatalogServer) => void;
+  onAuthorize: (server: CatalogServer) => void;
+  onDisconnect: (server: CatalogServer) => void;
+  testingServerIds?: ReadonlySet<string>;
+  disconnectingServerIds?: ReadonlySet<string>;
+  canTest: boolean;
+  canDisconnect: boolean;
+  oauthStatuses?: Readonly<Record<string, OAuthStatusEntry>>;
+  addErrors?: Readonly<Record<string, string>>;
+  onAddErrorRead?: (serverId: string) => void;
+  onRetryOAuthStatus?: (gatewayId: string) => void;
+}) {
+  const intl = useIntl();
+  const announcedCount = useDebouncedValue(servers.length, 300);
+
+  return (
+    <>
+      <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {intl.formatMessage({ id: "mcpServer.catalog.resultCount" }, { count: announcedCount })}
+      </p>
+      {servers.length > 0 ? (
+        <ul
+          aria-label={intl.formatMessage({ id: "mcpServer.catalog.resultsLabel" })}
+          className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-6"
+        >
+          {servers.map((server) => (
+            <CatalogCard
+              key={server.id}
+              server={server}
+              onView={(trigger) => onView(server, trigger)}
+              onAdd={() => onAdd(server)}
+              onTest={() => onTest(server)}
+              onAuthorize={() => onAuthorize(server)}
+              onDisconnect={() => onDisconnect(server)}
+              isAdding={addingServerIds.has(server.id)}
+              isTesting={testingServerIds.has(server.id)}
+              isDisconnecting={disconnectingServerIds.has(server.id)}
+              canTest={canTest}
+              canDisconnect={canDisconnect}
+              oauthStatuses={oauthStatuses}
+              addError={addErrors[server.id]}
+              onAddErrorRead={onAddErrorRead && (() => onAddErrorRead(server.id))}
+              onRetryOAuthStatus={onRetryOAuthStatus}
+            />
+          ))}
+        </ul>
+      ) : (
+        <EmptyStatePlaceholder messageId={emptyStateMessageId} />
+      )}
+    </>
+  );
+}

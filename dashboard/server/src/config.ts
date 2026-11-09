@@ -1,0 +1,246 @@
+// Location: ./client/server/src/config.ts
+// Copyright contributors to the MCP-CONTEXT-FORGE project
+// SPDX-License-Identifier: Apache-2.0
+//
+// Env-driven config for the BFF. All values have dev-safe defaults; override
+// via env in every non-local deployment (COOKIE_SECURE and CONTEXTFORGE_URL
+// in particular).
+
+function optional(name: string, fallback: string): string {
+  return process.env[name] ?? fallback;
+}
+
+// Distinct from `optional`: for values with no fallback, `KEY=` (empty string)
+// must mean "unset", not "explicitly set to empty" — otherwise `??` downstream
+// treats "" as a real value instead of falling through.
+function optionalUnset(name: string): string | undefined {
+  return process.env[name] || undefined;
+}
+
+// RFC 7230 token chars — blocks CR/LF/space/separators (header-injection guard).
+const HTTP_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+// Rejects file:/javascript:/data:/etc, and (for the browser-facing URL)
+// plain http: outside loopback -- an intercepted redirect there could leak
+// the PKCE code/authorization code over the network.
+function validateKeycloakUrl(name: string, value: string, requireHttps: boolean): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${name} "${value}" is not a valid URL`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`${name} "${value}" must use http: or https:`);
+  }
+  if (requireHttps && parsed.protocol !== "https:" && !LOOPBACK_HOSTS.has(parsed.hostname)) {
+    throw new Error(
+      `${name} "${value}" must use https: (http: only allowed for localhost/127.0.0.1)`,
+    );
+  }
+}
+
+export const config = {
+  port: Number(optional("PORT", "3000")),
+  host: optional("HOST", "0.0.0.0"),
+
+  // Upstream ContextForge API. All bearer-token traffic goes here,
+  // server-to-server only — the browser never talks to this origin directly.
+  // Not named after the upstream's current framework (FastAPI) since that's
+  // an implementation detail ContextForge could change independently.
+  contextforgeUrl: optional("CONTEXTFORGE_URL", "http://127.0.0.1:4444"),
+
+  // Header mcpgateway reads the bearer token from — must match its own AUTH_HEADER_NAME.
+  contextforgeAuthHeaderName: optional("CONTEXTFORGE_AUTH_HEADER_NAME", "Authorization"),
+
+  // Password-reset handlers can synchronously wait for SMTP (15s upstream
+  // default), so this must stay above the upstream email-delivery timeout.
+  passwordResetRequestTimeoutMs: Number(optional("PASSWORD_RESET_REQUEST_TIMEOUT_MS", "30000")),
+
+  // Shared by both OAuth popup proxy routes (routes/proxy/oauth-authorize.ts,
+  // oauth-callback.ts). GET /oauth/authorize/{id} can synchronously run DCR
+  // registration (an outbound call to the IdP's own registration/discovery
+  // endpoints) before it redirects, so this is sized for that -- more
+  // headroom than a plain API call needs.
+  oauthProxyTimeoutMs: Number(optional("OAUTH_PROXY_TIMEOUT_MS", "30000")),
+
+  // TTL for the one-time nonce minted by POST /oauth/authorize-nonce and
+  // required by GET /oauth/authorize/:gatewayId (see
+  // lib/oauth-authorize-nonce.ts). Short-lived on purpose: the SPA consumes
+  // it within milliseconds of minting it, so this only needs to cover
+  // however long a client can plausibly sit on a minted-but-unused nonce
+  // (e.g. a popup blocked before it navigates), not the OAuth flow itself.
+  oauthAuthorizeNonceTtlSeconds: Number(optional("OAUTH_AUTHORIZE_NONCE_TTL_SECONDS", "120")),
+
+  // BFF's own OIDC (PKCE) client of Keycloak — independent of ContextForge's
+  // own /auth/sso/* flow, which isn't usable cross-origin from this SPA.
+  ssoEnabled: optional("SSO_ENABLED", "false") === "true",
+  // Server-to-server base (discovery/token/JWKS calls never leave the BFF).
+  ssoKeycloakBaseUrl: optionalUnset("SSO_KEYCLOAK_BASE_URL"),
+  // Browser-facing base, if it differs from the internal one above.
+  ssoKeycloakPublicBaseUrl: optionalUnset("SSO_KEYCLOAK_PUBLIC_BASE_URL"),
+  ssoKeycloakRealm: optionalUnset("SSO_KEYCLOAK_REALM"),
+  ssoKeycloakClientId: optionalUnset("SSO_KEYCLOAK_CLIENT_ID"),
+  ssoKeycloakClientSecret: optionalUnset("SSO_KEYCLOAK_CLIENT_SECRET"), // pragma: allowlist secret
+  ssoKeycloakScopes: optionalUnset("SSO_KEYCLOAK_SCOPES") ?? "openid profile email",
+  // TTL for the one-time PKCE verifier/state/nonce minted by the login route
+  // and consumed by the callback route — same pattern as the nonce above.
+  ssoLoginStateTtlSeconds: Number(optional("SSO_LOGIN_STATE_TTL_SECONDS", "300")),
+  // Refresh an SSO session's Keycloak tokens this many seconds before
+  // tokenExpiresAt, not exactly at it.
+  ssoTokenRefreshLeewaySeconds: Number(optional("SSO_TOKEN_REFRESH_LEEWAY_SECONDS", "30")),
+
+  // memory:// (default) = in-process store, no Redis needed — dev only.
+  // See lib/memory-redis.ts. Use a real redis:// URL beyond a single
+  // local dev process. optionalUnset so REDIS_URL="" also falls through
+  // to this default and trips the fail-closed check below.
+  redisUrl: optionalUnset("REDIS_URL") ?? "memory://",
+
+  // Opaque session_id -> { bearerToken, user } TTL in Redis. Independent of
+  // the upstream JWT's own expiry; the BFF just stops trusting a stale
+  // session key once this elapses.
+  sessionTtlSeconds: Number(optional("SESSION_TTL_SECONDS", "86400")),
+
+  // Redis key namespace, in case multiple BFF deployments (staging/prod)
+  // ever share one Redis instance.
+  redisKeyPrefix: optional("REDIS_KEY_PREFIX", "bff"),
+
+  cookieDomain: optionalUnset("COOKIE_DOMAIN"), // undefined = host-only cookie
+  cookieSecure: optional("COOKIE_SECURE", "true") === "true",
+
+  // Exact scheme://host the BFF is publicly reached at, for Origin-header
+  // validation on routes that can't use CSRF tokens (see lib/origin-guard.ts).
+  // undefined = derive from the request itself (request.protocol/host) —
+  // fine for a single-hostname deployment, but set this explicitly behind a
+  // reverse proxy where that derivation isn't trustworthy (e.g.
+  // TLS-terminated without TRUST_PROXY=true), or where request.host can't
+  // be relied on for other reasons.
+  publicOrigin: optionalUnset("PUBLIC_ORIGIN"),
+
+  // Trust X-Forwarded-For so request.ip is the real client, not the LB. Only
+  // safe behind a trusted proxy — default off so a direct-exposed BFF
+  // doesn't let clients forge their own IP. Opt in with TRUST_PROXY=true.
+  trustProxy: optional("TRUST_PROXY", "false") === "true",
+
+  // SPA build directory (see plugins/static.ts). undefined = default,
+  // computed relative to that plugin's own file location
+  // (`npm run build` -> server/public/). Override
+  // for a non-standard layout, or to point at a temp dir in tests.
+  publicDir: optionalUnset("PUBLIC_DIR"),
+
+  // Set to a running Vite dev server's origin (e.g. http://localhost:5173)
+  // to reverse-proxy everything not owned by the BFF's own routes (SPA
+  // shell, JS/CSS modules, HMR) to it instead of serving server/public/ —
+  // see plugins/vite-dev-proxy.ts, registered instead of plugins/static.ts
+  // when this is set. Lets the browser visit the BFF's own origin and get
+  // HMR, instead of visiting Vite directly (which would need PUBLIC_ORIGIN
+  // set to match, since origin-guard.ts checks the browser's actual
+  // Origin). Unset (default) = serve the built SPA as usual.
+  viteDevServerUrl: optionalUnset("VITE_DEV_SERVER_URL"),
+
+  // Session-revocation re-check cadence for long-lived SSE connections
+  // (Option A from agent-output/bff-proxy-and-sse-plan.md — bounded staleness,
+  // no pub/sub required). Revisit if instant revocation becomes a hard requirement.
+  sseSessionRecheckSeconds: Number(optional("SSE_SESSION_RECHECK_SECONDS", "15")),
+
+  logLevel: optional("LOG_LEVEL", "info"),
+} as const;
+
+// NODE_ENV isn't reliably set by the start script, so also fail closed on COOKIE_SECURE=true (prod's default).
+if (
+  config.redisUrl.startsWith("memory://") &&
+  (process.env.NODE_ENV === "production" || config.cookieSecure)
+) {
+  throw new Error("REDIS_URL=memory:// is dev-only — set a real redis:// URL in production");
+}
+
+// NODE_TLS_REJECT_UNAUTHORIZED=0 disables TLS verification for every
+// outbound call (Node reads it per connection, globally) — a MITM on all
+// bearer-token traffic if it ever reached production. Only the literal
+// string "0" disables verification in Node; trust a self-signed cert with
+// NODE_EXTRA_CA_CERTS instead (see docker-compose.tls.yml's cert_init).
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && config.cookieSecure) {
+  throw new Error(
+    "NODE_TLS_REJECT_UNAUTHORIZED=0 disables TLS verification for all outbound calls — " +
+      "not allowed with COOKIE_SECURE=true. Trust a self-signed cert with NODE_EXTRA_CA_CERTS instead.",
+  );
+}
+
+if (!HTTP_TOKEN_RE.test(config.contextforgeAuthHeaderName)) {
+  throw new Error(
+    `CONTEXTFORGE_AUTH_HEADER_NAME "${config.contextforgeAuthHeaderName}" is not a valid HTTP header token`,
+  );
+}
+
+if (
+  !Number.isSafeInteger(config.passwordResetRequestTimeoutMs) ||
+  config.passwordResetRequestTimeoutMs <= 0
+) {
+  throw new Error("PASSWORD_RESET_REQUEST_TIMEOUT_MS must be a positive integer");
+}
+
+if (!Number.isSafeInteger(config.oauthProxyTimeoutMs) || config.oauthProxyTimeoutMs <= 0) {
+  throw new Error("OAUTH_PROXY_TIMEOUT_MS must be a positive integer");
+}
+
+if (
+  !Number.isSafeInteger(config.oauthAuthorizeNonceTtlSeconds) ||
+  config.oauthAuthorizeNonceTtlSeconds <= 0
+) {
+  throw new Error("OAUTH_AUTHORIZE_NONCE_TTL_SECONDS must be a positive integer");
+}
+
+if (!Number.isSafeInteger(config.ssoLoginStateTtlSeconds) || config.ssoLoginStateTtlSeconds <= 0) {
+  throw new Error("SSO_LOGIN_STATE_TTL_SECONDS must be a positive integer");
+}
+
+if (
+  !Number.isSafeInteger(config.ssoTokenRefreshLeewaySeconds) ||
+  config.ssoTokenRefreshLeewaySeconds < 0
+) {
+  throw new Error("SSO_TOKEN_REFRESH_LEEWAY_SECONDS must be a non-negative integer");
+}
+
+// Fail fast at boot, not at the first /auth/sso/login request.
+if (config.ssoEnabled) {
+  const missingSsoVars = [
+    ["SSO_KEYCLOAK_BASE_URL", config.ssoKeycloakBaseUrl],
+    ["SSO_KEYCLOAK_REALM", config.ssoKeycloakRealm],
+    ["SSO_KEYCLOAK_CLIENT_ID", config.ssoKeycloakClientId],
+    ["SSO_KEYCLOAK_CLIENT_SECRET", config.ssoKeycloakClientSecret],
+  ]
+    .filter(([, value]) => !value)
+    .map(([name]) => name);
+
+  if (missingSsoVars.length > 0) {
+    throw new Error(`SSO_ENABLED=true requires ${missingSsoVars.join(", ")} to be set`);
+  }
+
+  // Catch a malformed or unsafe URL at boot instead of at the first
+  // /auth/sso/login request's discovery fetch. Only the browser-facing
+  // (public) URL must be https: -- the internal one is server-to-server and
+  // may legitimately be plain http: on a private/Docker network.
+  if (config.ssoKeycloakBaseUrl) {
+    validateKeycloakUrl("SSO_KEYCLOAK_BASE_URL", config.ssoKeycloakBaseUrl, false);
+  }
+  if (config.ssoKeycloakPublicBaseUrl) {
+    validateKeycloakUrl("SSO_KEYCLOAK_PUBLIC_BASE_URL", config.ssoKeycloakPublicBaseUrl, true);
+  }
+}
+
+// COOKIE_SECURE=true (prod default) with neither PUBLIC_ORIGIN nor TRUST_PROXY
+// set means origin-guard.ts derives its expected origin from request.protocol,
+// which is wrong behind a TLS-terminating proxy (it reads "http" while the
+// browser sends "https"). That silently 403s every login and SSE connection,
+// so fail fast at boot instead of at the first request.
+if (config.cookieSecure && !config.publicOrigin && !config.trustProxy) {
+  throw new Error(
+    "COOKIE_SECURE=true requires either PUBLIC_ORIGIN or TRUST_PROXY=true, " +
+      "otherwise origin-guard.ts can't validate Origin behind a reverse proxy " +
+      "(request.protocol won't reflect TLS termination). Set PUBLIC_ORIGIN to " +
+      "this deployment's exact scheme://host, or TRUST_PROXY=true if the BFF " +
+      "is directly TLS-terminated.",
+  );
+}

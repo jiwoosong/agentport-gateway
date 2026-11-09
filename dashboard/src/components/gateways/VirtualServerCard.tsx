@@ -1,0 +1,202 @@
+import {
+  formatServerTimestamp,
+  getTagDisplay,
+  getVirtualServerComponentCounts,
+} from "@/components/gateways/utils";
+import { MCPIcon } from "@/components/icons/MCPIcon";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
+import { TruncatedText } from "@/components/ui/truncated-text";
+import type { VirtualServer } from "@/types/server";
+import { Box, EllipsisVertical, MessageSquareCode, Plus, Wrench } from "lucide-react";
+import { useIntl } from "react-intl";
+
+export function VirtualServerCard({
+  server,
+  onViewDetails,
+  onAddComponents,
+  onEdit,
+  onDelete,
+  onToggleStatus,
+  isToggling = false,
+  toggleDisabled = false,
+  isDeleting = false,
+  deleteDisabled = false,
+  className,
+}: {
+  server: VirtualServer;
+  onViewDetails: (server: VirtualServer) => void;
+  onAddComponents?: (server: VirtualServer) => void;
+  onEdit?: (server: VirtualServer) => void;
+  onDelete?: (server: VirtualServer) => void;
+  onToggleStatus?: (server: VirtualServer) => void;
+  isToggling?: boolean;
+  toggleDisabled?: boolean;
+  isDeleting?: boolean;
+  deleteDisabled?: boolean;
+  className?: string;
+}) {
+  const intl = useIntl();
+  const { toolCount, resourceCount, promptCount, total } = getVirtualServerComponentCounts(server);
+  const tags = (server.tags ?? []).map((tag, index) => getTagDisplay(tag, index));
+  const isEmptyComposition = total === 0;
+
+  return (
+    <Card
+      size="sm"
+      className={cn("cursor-pointer transition-colors hover:bg-accent/50", className)}
+      data-testid="virtual-server-card"
+      data-server-name={server.name}
+      onClick={() => onViewDetails(server)}
+    >
+      <CardHeader className="gap-3">
+        <div className="flex items-center gap-3">
+          <span className="flex size-6 shrink-0 items-center justify-center rounded bg-server-icon-bg text-black">
+            <MCPIcon className="size-3.5 [&_path]:fill-current" />
+          </span>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <CardTitle className="min-w-0 font-semibold">
+              <TruncatedText>{server.name}</TruncatedText>
+            </CardTitle>
+            <span
+              className={cn(
+                "size-1.5 shrink-0 rounded-full",
+                server.enabled ? "bg-tool-status-active" : "bg-tool-status-inactive",
+              )}
+              data-testid="status-indicator"
+              role="img"
+              aria-label={intl.formatMessage({
+                id: server.enabled ? "gateways.card.enabled" : "gateways.card.disabled",
+              })}
+            />
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Actions for ${server.name}`}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <EllipsisVertical className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onViewDetails(server);
+                  }}
+                >
+                  {intl.formatMessage({ id: "gateways.card.viewDetails" })}
+                </DropdownMenuItem>
+                {onEdit && (
+                  <DropdownMenuItem
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onEdit(server);
+                    }}
+                  >
+                    {intl.formatMessage({ id: "gateways.card.editServer" })}
+                  </DropdownMenuItem>
+                )}
+                {onToggleStatus && (
+                  <DropdownMenuItem
+                    disabled={isToggling || toggleDisabled}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleStatus(server);
+                    }}
+                  >
+                    {intl.formatMessage({
+                      id: server.enabled ? "gateways.card.deactivate" : "gateways.card.activate",
+                    })}
+                  </DropdownMenuItem>
+                )}
+                {onDelete && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={isDeleting || deleteDisabled}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDelete(server);
+                      }}
+                      className="text-destructive focus:text-destructive"
+                    >
+                      {intl.formatMessage({ id: "common.button.delete" })}
+                    </DropdownMenuItem>
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      </CardHeader>
+      {isEmptyComposition ? (
+        <CardContent>
+          <Button
+            type="button"
+            variant="secondary"
+            className="h-10 w-full justify-start rounded-sm px-3 text-left text-[13px] text-muted-foreground"
+            onClick={() => onAddComponents?.(server)}
+          >
+            <Plus className="size-4" />
+            {intl.formatMessage({ id: "gateways.card.addSourcesAndComponents" })}
+          </Button>
+        </CardContent>
+      ) : (
+        <CardContent className="space-y-3">
+          <div className="flex items-center gap-3 text-[13px] font-medium text-secondary-foreground">
+            <span className="flex items-center gap-2" data-testid="tool-count">
+              <Wrench className="size-4 text-muted-foreground" />
+              {toolCount}
+            </span>
+            <span className="text-border">•</span>
+            <span className="flex items-center gap-2" data-testid="resource-count">
+              <Box className="size-4 text-muted-foreground" />
+              {resourceCount}
+            </span>
+            <span className="text-border">•</span>
+            <span className="flex items-center gap-2" data-testid="prompt-count">
+              <MessageSquareCode className="size-4 text-muted-foreground" />
+              {promptCount}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 overflow-hidden">
+            <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+              {tags.map((tag) => (
+                <Badge
+                  key={tag.key}
+                  variant="outline"
+                  className="shrink-0 px-1.5 py-0 text-[10px] font-medium text-muted-foreground"
+                >
+                  {tag.label}
+                </Badge>
+              ))}
+            </div>
+            <TruncatedText
+              className="shrink-0 text-[13px] text-muted-foreground"
+              data-testid="last-updated"
+            >
+              {formatServerTimestamp(
+                server.updatedAt || server.createdAt,
+                intl.formatMessage({ id: "gateways.card.notSyncedYet" }),
+              )}
+            </TruncatedText>
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  );
+}

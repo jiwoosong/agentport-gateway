@@ -1,0 +1,454 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useIntl } from "react-intl";
+import { Info } from "lucide-react";
+import { toast } from "sonner";
+import { ConnectSourceCard } from "@/components/gateways/ConnectSourceCard";
+import { VirtualServerCard } from "@/components/gateways/VirtualServerCard";
+import { VirtualServerDetailsPanel } from "@/components/gateways/VirtualServerDetailsPanel";
+import { ConfirmDialog } from "@/components/servers/ConfirmDialog";
+import { Loading } from "@/components/ui/loading";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  deleteVirtualServer,
+  getVirtualServer,
+  setVirtualServerState,
+  updateVirtualServerComponents,
+  updateVirtualServerTags,
+} from "@/api/virtualServers";
+import { ApiError } from "@/api/client";
+import { useAuth } from "@/auth/useAuth";
+import { useQuery } from "@/hooks/useQuery";
+import { useRouter } from "@/router";
+import type { VirtualServer, VirtualServersResponse } from "@/types/server";
+import { extractApiErrorDetail, sanitizeError } from "@/utils/errors";
+
+const DEFAULT_PAGE_SIZE = 12;
+const SERVERS_QUERY_PATH = `/v1/virtual-servers?limit=${DEFAULT_PAGE_SIZE}&include_inactive=true&include_pagination=true`;
+const CREATE_SERVER_PATH = "/app/gateways/create-server";
+const EDIT_SERVER_ID_QUERY_PARAM = "editServerId";
+
+export function Gateways() {
+  const intl = useIntl();
+  const { navigate, path } = useRouter();
+  const { hasPermission, permissionsLoading } = useAuth();
+  const canCreateServer = !permissionsLoading && hasPermission("servers.create");
+  const { data, error, isLoading, refetch, setData } =
+    useQuery<VirtualServersResponse>(SERVERS_QUERY_PATH);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const pendingDeleteServerIdRef = useRef<string | null>(null);
+  const pendingToggleServerIdRef = useRef<string | null>(null);
+  const [detailsServer, setDetailsServer] = useState<VirtualServer | null>(null);
+  const [detailsServerId, setDetailsServerId] = useState<string | null>(null);
+  const [isDetailsPanelOpen, setIsDetailsPanelOpen] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteServer, setDeleteServer] = useState<VirtualServer | null>(null);
+  const [deletedServerIds, setDeletedServerIds] = useState<Set<string>>(() => new Set());
+  const [pendingDeleteServerId, setPendingDeleteServerId] = useState<string | null>(null);
+  const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
+  const [deactivateServer, setDeactivateServer] = useState<VirtualServer | null>(null);
+  const [pendingToggleServerId, setPendingToggleServerId] = useState<string | null>(null);
+  const servers = useMemo(
+    () => (data?.servers ?? []).filter((server) => !deletedServerIds.has(server.id)),
+    [data?.servers, deletedServerIds],
+  );
+  const selectedSearchServerId = useMemo(() => {
+    const queryString = path.split("?")[1] ?? "";
+    return new URLSearchParams(queryString).get("selected")?.trim() || null;
+  }, [path]);
+  const isDeletePending = pendingDeleteServerId !== null;
+  const isTogglePending = pendingToggleServerId !== null;
+
+  // Patches one server in the page list and the open details panel.
+  const handleServerUpdated = useCallback(
+    (updated: VirtualServer) => {
+      setData((previous) =>
+        previous
+          ? {
+              ...previous,
+              servers: (previous.servers ?? []).map((candidate) =>
+                candidate.id === updated.id ? updated : candidate,
+              ),
+            }
+          : previous,
+      );
+      setDetailsServer((current) => (current?.id === updated.id ? updated : current));
+    },
+    [setData],
+  );
+
+  const setServerState = useCallback(
+    async (server: VirtualServer, activate: boolean) => {
+      if (pendingToggleServerIdRef.current) return false;
+
+      pendingToggleServerIdRef.current = server.id;
+      setPendingToggleServerId(server.id);
+
+      try {
+        const updated = await setVirtualServerState(server.id, activate);
+        handleServerUpdated(updated);
+        toast.success(
+          intl.formatMessage(
+            {
+              id: activate ? "gateways.state.activateSuccess" : "gateways.state.deactivateSuccess",
+            },
+            { name: server.name },
+          ),
+        );
+        return true;
+      } catch (err) {
+        const detail = err instanceof ApiError ? extractApiErrorDetail(err.body) : null;
+        toast.error(
+          detail ||
+            intl.formatMessage({
+              id: activate ? "gateways.state.activateError" : "gateways.state.deactivateError",
+            }),
+        );
+        return false;
+      } finally {
+        pendingToggleServerIdRef.current = null;
+        setPendingToggleServerId(null);
+      }
+    },
+    [intl, handleServerUpdated],
+  );
+
+  const handleToggleStatus = useCallback(
+    (server: VirtualServer) => {
+      if (isTogglePending) return;
+      if (server.enabled) {
+        setDeactivateServer(server);
+        setDeactivateDialogOpen(true);
+        return;
+      }
+      void setServerState(server, true);
+    },
+    [isTogglePending, setServerState],
+  );
+
+  const confirmDeactivate = useCallback(async () => {
+    if (!deactivateServer) return;
+    const succeeded = await setServerState(deactivateServer, false);
+    if (succeeded) {
+      setDeactivateDialogOpen(false);
+      setDeactivateServer(null);
+    }
+  }, [deactivateServer, setServerState]);
+
+  const handleDeactivateDialogOpenChange = useCallback((open: boolean) => {
+    setDeactivateDialogOpen(open);
+    if (!open) setDeactivateServer(null);
+  }, []);
+
+  const handleDelete = useCallback(
+    (server: VirtualServer) => {
+      if (isDeletePending) return;
+      setDeleteServer(server);
+      setDeleteDialogOpen(true);
+    },
+    [isDeletePending],
+  );
+
+  const handleDeleteDialogOpenChange = useCallback((open: boolean) => {
+    setDeleteDialogOpen(open);
+    if (!open) {
+      setDeleteServer(null);
+    }
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteServer || pendingDeleteServerIdRef.current) return;
+
+    const serverToDelete = deleteServer;
+    const previousDetailsServer = detailsServer;
+    const previousDetailsServerId = detailsServerId;
+    pendingDeleteServerIdRef.current = serverToDelete.id;
+    setPendingDeleteServerId(serverToDelete.id);
+    // Close dialog and clear form state immediately
+    setDeleteDialogOpen(false);
+    setDeleteServer(null);
+    // Remove the card from the grid right away for a snappy feel
+    setDetailsServer((current) => (current?.id === serverToDelete.id ? null : current));
+    setDetailsServerId((current) => (current === serverToDelete.id ? null : current));
+    setDeletedServerIds((previous) => {
+      const next = new Set(previous);
+      next.add(serverToDelete.id);
+      return next;
+    });
+
+    try {
+      await deleteVirtualServer(serverToDelete.id);
+
+      toast.success(
+        intl.formatMessage({ id: "gateways.delete.success" }, { name: serverToDelete.name }),
+      );
+      try {
+        await refetch();
+      } catch (refreshErr) {
+        console.error(
+          "Failed to refresh virtual servers after deletion:",
+          sanitizeError(refreshErr),
+        );
+      }
+    } catch (err) {
+      // ROLLBACK on failure
+      setDeletedServerIds((previous) => {
+        const next = new Set(previous);
+        next.delete(serverToDelete.id);
+        return next;
+      });
+      setDetailsServer(previousDetailsServer);
+      setDetailsServerId(previousDetailsServerId);
+      const errorMessage = sanitizeError(err);
+      toast.error(intl.formatMessage({ id: "gateways.delete.errorTitle" }), {
+        description: errorMessage,
+      });
+      console.error("Failed to delete virtual server:", errorMessage);
+    } finally {
+      pendingDeleteServerIdRef.current = null;
+      setPendingDeleteServerId(null);
+    }
+  }, [deleteServer, detailsServer, detailsServerId, intl, refetch]);
+
+  const openDetailsPanel = (server: VirtualServer) => {
+    setDetailsServer(server);
+    setDetailsServerId(server.id);
+    setIsDetailsPanelOpen(true);
+  };
+
+  const openEditPanel = (server: VirtualServer) => {
+    const params = new URLSearchParams({ [EDIT_SERVER_ID_QUERY_PARAM]: server.id });
+    navigate(`${CREATE_SERVER_PATH}?${params.toString()}`);
+  };
+
+  useEffect(() => {
+    if (!selectedSearchServerId) return;
+    const seedServer = servers.find((server) => server.id === selectedSearchServerId) ?? null;
+    setDetailsServer(seedServer);
+    setDetailsServerId(selectedSearchServerId);
+    setIsDetailsPanelOpen(true);
+  }, [selectedSearchServerId, servers]);
+
+  if (error && !isLoading && servers.length === 0) {
+    return (
+      <div className="p-6">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4" role="alert">
+          <h1 className="font-semibold text-destructive">
+            {intl.formatMessage({ id: "gateways.errorLoadingVirtualServers" })}
+          </h1>
+          <p className="text-sm text-destructive">{error.message}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6">
+      <div className="mb-6 flex items-center gap-2">
+        <h1 ref={headingRef} tabIndex={-1} className="text-base font-semibold text-foreground">
+          {intl.formatMessage({ id: "gateways.title" })}
+        </h1>
+        <Tooltip>
+          <TooltipTrigger
+            aria-label={intl.formatMessage({ id: "gateways.titleTooltip.trigger" })}
+            className="rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Info className="size-4" aria-hidden="true" />
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            {intl.formatMessage({ id: "gateways.titleTooltip" })}
+          </TooltipContent>
+        </Tooltip>
+      </div>
+
+      {isLoading && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+          className="flex items-center justify-center p-12"
+        >
+          <Loading />
+          <span className="sr-only">
+            {intl.formatMessage({ id: "gateways.loadingVirtualServers" })}
+          </span>
+        </div>
+      )}
+
+      {error && (
+        <div
+          className="mb-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4"
+          role="alert"
+        >
+          <h2 className="font-semibold text-destructive">
+            {intl.formatMessage({ id: "gateways.errorLoadingVirtualServers" })}
+          </h2>
+          <p className="text-sm text-destructive">{error.message}</p>
+        </div>
+      )}
+
+      {!isLoading && (
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2 2xl:grid-cols-3">
+          {canCreateServer && <ConnectSourceCard onAction={() => navigate(CREATE_SERVER_PATH)} />}
+          {servers.map((server) => (
+            <VirtualServerCard
+              key={server.id}
+              server={server}
+              onViewDetails={openDetailsPanel}
+              onAddComponents={openEditPanel}
+              onEdit={openEditPanel}
+              onToggleStatus={handleToggleStatus}
+              onDelete={handleDelete}
+              isToggling={pendingToggleServerId === server.id}
+              toggleDisabled={
+                isDeletePending || (isTogglePending && pendingToggleServerId !== server.id)
+              }
+              isDeleting={pendingDeleteServerId === server.id}
+              deleteDisabled={
+                isTogglePending || (isDeletePending && pendingDeleteServerId !== server.id)
+              }
+            />
+          ))}
+        </div>
+      )}
+
+      {detailsServerId && (
+        <VirtualServerDetailsPanelContainer
+          serverId={detailsServerId}
+          server={detailsServer}
+          open={isDetailsPanelOpen}
+          onClose={() => setIsDetailsPanelOpen(false)}
+          onAddSources={(server) => openEditPanel(server)}
+          onServerUpdated={handleServerUpdated}
+        />
+      )}
+
+      <ConfirmDialog
+        open={deactivateDialogOpen}
+        role="alertdialog"
+        onOpenChange={handleDeactivateDialogOpenChange}
+        title={intl.formatMessage({ id: "gateways.state.deactivateTitle" })}
+        description={intl.formatMessage(
+          { id: "gateways.state.deactivateDescription" },
+          { name: deactivateServer?.name ?? intl.formatMessage({ id: "gateways.title" }) },
+        )}
+        confirmLabel={intl.formatMessage({ id: "gateways.card.deactivate" })}
+        cancelLabel={intl.formatMessage({ id: "common.button.cancel" })}
+        variant="destructive"
+        onConfirm={confirmDeactivate}
+        isLoading={pendingToggleServerId === deactivateServer?.id}
+        loadingLabel={intl.formatMessage({ id: "gateways.state.deactivating" })}
+        closeOnConfirm={false}
+      />
+
+      <ConfirmDialog
+        open={deleteDialogOpen}
+        role="alertdialog"
+        onOpenChange={handleDeleteDialogOpenChange}
+        title={intl.formatMessage({ id: "gateways.delete.title" })}
+        description={intl.formatMessage(
+          { id: "gateways.delete.description" },
+          { name: deleteServer?.name ?? intl.formatMessage({ id: "gateways.title" }) },
+        )}
+        confirmLabel={intl.formatMessage({ id: "common.button.delete" })}
+        cancelLabel={intl.formatMessage({ id: "common.button.cancel" })}
+        variant="destructive"
+        onConfirm={confirmDelete}
+        isLoading={pendingDeleteServerId === deleteServer?.id}
+        loadingLabel={intl.formatMessage({ id: "gateways.delete.deleting" })}
+        closeOnConfirm={false}
+      />
+    </div>
+  );
+}
+
+function VirtualServerDetailsPanelContainer({
+  serverId,
+  server,
+  open,
+  onClose,
+  onAddSources,
+  onServerUpdated,
+}: {
+  serverId: string;
+  server: VirtualServer | null;
+  open: boolean;
+  onClose: () => void;
+  onAddSources: (server: VirtualServer) => void;
+  onServerUpdated: (server: VirtualServer) => void;
+}) {
+  const intl = useIntl();
+  const {
+    data: serverDetails,
+    error,
+    setData: setServerDetails,
+  } = useQuery<VirtualServer>(`/v1/virtual-servers/${encodeURIComponent(serverId)}`);
+  const hydratedServer = serverDetails?.id === serverId ? serverDetails : server;
+
+  useEffect(() => {
+    if (!server) return;
+    setServerDetails((current) =>
+      current?.id === server.id ? { ...current, ...server } : current,
+    );
+  }, [server, setServerDetails]);
+
+  const handleAddTag = useCallback(
+    async (id: string, tags: string[]) => {
+      try {
+        const updated = await updateVirtualServerTags(id, tags);
+        // Patch the fetched detail in place rather than refetching the server.
+        setServerDetails((prev) => (prev && prev.id === updated.id ? updated : prev));
+      } catch (err) {
+        const detail = err instanceof ApiError ? extractApiErrorDetail(err.body) : null;
+        toast.error(detail || intl.formatMessage({ id: "gateways.tags.addError" }));
+        throw err;
+      }
+    },
+    [setServerDetails, intl],
+  );
+
+  const handleRemoveComponent = useCallback(
+    async (kind: "tools" | "resources" | "prompts", componentId: string) => {
+      if (!hydratedServer) return;
+      try {
+        // The PUT replaces the whole list, so read it fresh to keep concurrent edits.
+        // ponytail: still racy between GET and PUT; needs a backend remove-one endpoint or version check.
+        const latest = await getVirtualServer(hydratedServer.id);
+        const current =
+          kind === "tools"
+            ? (latest.associatedToolIds ?? [])
+            : kind === "resources"
+              ? (latest.associatedResources ?? [])
+              : (latest.associatedPrompts ?? []);
+        const updated = await updateVirtualServerComponents(
+          hydratedServer.id,
+          kind,
+          current.filter((id) => id !== componentId),
+        );
+        setServerDetails((prev) => (prev && prev.id === updated.id ? updated : prev));
+        onServerUpdated(updated);
+      } catch (err) {
+        const detail = err instanceof ApiError ? extractApiErrorDetail(err.body) : null;
+        toast.error(detail || intl.formatMessage({ id: "gateways.details.remove.error" }));
+        throw err;
+      }
+    },
+    [hydratedServer, setServerDetails, onServerUpdated, intl],
+  );
+
+  if (!hydratedServer) {
+    return null;
+  }
+
+  return (
+    <VirtualServerDetailsPanel
+      key={hydratedServer.id}
+      server={hydratedServer}
+      error={error}
+      open={open}
+      onClose={onClose}
+      onAddSources={() => onAddSources(hydratedServer)}
+      onAddTag={handleAddTag}
+      onRemoveComponent={handleRemoveComponent}
+    />
+  );
+}

@@ -1,0 +1,6 @@
+{
+  "environment": "Linux amd64, Python 3.14, Node 24, SQLite dev",
+  "startup_seconds": 3.8,
+  "gateway_peak_rss_kib": 414936,
+  "note": "Single cold-start sample; excludes BFF, browser, DB services and GPU models. Not a capacity benchmark."
+}

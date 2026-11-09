@@ -1,0 +1,564 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { Bot, Code2, Grid3x3, Wrench } from "lucide-react";
+import { http, HttpResponse } from "msw";
+import { SourceSelection } from "@/components/gateways/SourceSelection";
+import type { ActionCard } from "@/components/gateways/types";
+import { server } from "@/test/mocks/server";
+import { renderWithProviders } from "@/test/test-utils";
+
+const authState = vi.hoisted(() => ({
+  hasPermission: vi.fn<(permission: string) => boolean>(() => true),
+  permissionsLoading: false,
+}));
+
+vi.mock("@/auth/useAuth", () => ({
+  useAuth: () => authState,
+}));
+
+const actionCards: ActionCard[] = [
+  {
+    icon: Wrench,
+    title: "MCP server",
+    description: "Register an MCP server",
+    buttonText: "Connect",
+    onAction: vi.fn(),
+  },
+];
+
+function buildFourActionCards() {
+  const mcpAction = vi.fn();
+  const aiAction = vi.fn();
+  const restAction = vi.fn();
+  const grpcAction = vi.fn();
+  const cards: ActionCard[] = [
+    {
+      icon: Wrench,
+      title: "MCP server",
+      description: "Register an MCP server",
+      buttonText: "Connect",
+      onAction: mcpAction,
+    },
+    {
+      icon: Bot,
+      title: "AI agent",
+      description: "Add an agent over A2A, OpenAI, or Anthropic protocols",
+      buttonText: "Connect",
+      onAction: aiAction,
+    },
+    {
+      icon: Code2,
+      title: "REST API",
+      description: "Wrap a HTTP endpoint as a MCP tool",
+      buttonText: "Connect",
+      onAction: restAction,
+      disabled: true,
+      disabledReason: "Coming soon",
+    },
+    {
+      icon: Grid3x3,
+      title: "gRPC",
+      description: "Translate a gRPC endpoint as a MCP tool.",
+      buttonText: "Connect",
+      onAction: grpcAction,
+      disabled: true,
+      disabledReason: "Coming soon",
+    },
+  ];
+  return { cards, mcpAction, aiAction, restAction, grpcAction };
+}
+
+describe("SourceSelection", () => {
+  beforeEach(() => {
+    authState.hasPermission.mockReturnValue(true);
+    authState.permissionsLoading = false;
+  });
+
+  it("lazy-loads selectable MCP servers and hides sources already in the virtual server", async () => {
+    const user = userEvent.setup();
+    let gatewaysRequestCount = 0;
+    server.use(
+      http.get("*/v1/mcp-servers", () => {
+        gatewaysRequestCount += 1;
+        return HttpResponse.json({
+          gateways: [
+            {
+              id: "already-attached",
+              name: "already-attached",
+              url: "http://localhost:9000",
+              transport: "SSE",
+              enabled: true,
+              reachable: true,
+              visibility: "public",
+              tool_count: 2,
+              resource_count: 1,
+              prompt_count: 0,
+              created_at: "2024-01-01T00:00:00Z",
+              updated_at: "2024-01-01T00:00:00Z",
+            },
+            {
+              id: "github-notify",
+              name: "github-notify",
+              url: "http://localhost:9001",
+              transport: "SSE",
+              enabled: true,
+              reachable: true,
+              visibility: "public",
+              tool_count: 5,
+              resource_count: 2,
+              prompt_count: 1,
+              created_at: "2024-01-01T00:00:00Z",
+              updated_at: "2024-01-01T00:00:00Z",
+            },
+          ],
+        });
+      }),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        associatedMCPServerIds={["already-attached"]}
+        createServerActions={{
+          onBack: vi.fn(),
+          onSkip: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(gatewaysRequestCount).toBe(0);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+
+    expect(await screen.findByText("github-notify")).toBeInTheDocument();
+    expect(screen.queryByText("already-attached")).not.toBeInTheDocument();
+    expect(gatewaysRequestCount).toBe(1);
+
+    const githubCheckbox = screen.getByRole("checkbox", { name: "Select github-notify" });
+    expect(githubCheckbox).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Skip for now" })).toBeInTheDocument();
+
+    await user.click(githubCheckbox);
+
+    expect(githubCheckbox).toBeChecked();
+    expect(screen.getByRole("button", { name: "Submit" })).toBeInTheDocument();
+
+    await user.click(githubCheckbox);
+
+    expect(githubCheckbox).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Skip for now" })).toBeInTheDocument();
+  });
+
+  it("shows an empty message when no MCP servers are available", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({
+          gateways: [],
+        }),
+      ),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        createServerActions={{
+          onBack: vi.fn(),
+          onSkip: vi.fn(),
+        }}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+
+    expect(await screen.findByText("No MCP servers found.")).toBeInTheDocument();
+  });
+
+  it("shows an alert when MCP server loading fails", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({ detail: "Gateway list failed" }, { status: 500 }),
+      ),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        createServerActions={{
+          onBack: vi.fn(),
+          onSkip: vi.fn(),
+        }}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("HTTP 500");
+  });
+
+  it("does not load MCP servers without gateways.read", async () => {
+    const user = userEvent.setup();
+    const gatewaysRequest = vi.fn();
+    const oauthStatusRequest = vi.fn();
+    authState.hasPermission.mockReturnValue(false);
+    server.use(
+      http.get("*/v1/mcp-servers", () => {
+        gatewaysRequest();
+        return HttpResponse.json({ gateways: [] });
+      }),
+      http.get("*/api/oauth/status", () => {
+        oauthStatusRequest();
+        return HttpResponse.json({});
+      }),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+
+    expect(await screen.findByText("No MCP servers found.")).toBeInTheDocument();
+    expect(gatewaysRequest).not.toHaveBeenCalled();
+    expect(oauthStatusRequest).not.toHaveBeenCalled();
+  });
+
+  it("keeps OAuth sources selectable and retries unavailable caller status", async () => {
+    const user = userEvent.setup();
+    let statusRequests = 0;
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({
+          gateways: [
+            {
+              id: "oauth-source",
+              name: "OAuth source",
+              url: "https://source.example/mcp",
+              transport: "SSE",
+              enabled: true,
+              reachable: true,
+              visibility: "public",
+              authType: "oauth",
+              tool_count: 1,
+              resource_count: 0,
+              prompt_count: 0,
+            },
+          ],
+        }),
+      ),
+      http.get("*/api/oauth/status", () => {
+        statusRequests += 1;
+        if (statusRequests === 1) {
+          return HttpResponse.json({ detail: "temporary failure" }, { status: 500 });
+        }
+        return HttpResponse.json({
+          "oauth-source": {
+            oauth_enabled: true,
+            grant_type: "authorization_code",
+            user_token_status: { status: "missing", authorized: false },
+          },
+        });
+      }),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+
+    const checkbox = await screen.findByRole("checkbox", { name: "Select OAuth source" });
+    expect(checkbox).toBeEnabled();
+    expect(
+      await screen.findByRole("button", {
+        name: "OAuth source status: Authorization status unavailable. Show details",
+      }),
+    ).toBeInTheDocument();
+
+    await user.click(checkbox);
+    expect(checkbox).toBeChecked();
+    await user.click(
+      screen.getByRole("button", {
+        name: "OAuth source status: Authorization status unavailable. Show details",
+      }),
+    );
+    await user.click(await screen.findByRole("button", { name: "Retry status for OAuth source" }));
+
+    expect(
+      await screen.findByRole("button", {
+        name: "OAuth source status: Authorization required. Show details",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Authorize from Server catalog or MCP Servers. Your wizard selections will be preserved.",
+      ),
+    ).toBeInTheDocument();
+    expect(checkbox).toBeChecked();
+  });
+
+  it("shows the connect button only on the initially selected card", () => {
+    const { cards } = buildFourActionCards();
+
+    renderWithProviders(<SourceSelection actionCards={cards} />);
+
+    expect(screen.getAllByRole("button", { name: "Connect" })).toHaveLength(1);
+  });
+
+  it("moves the connect button when a different enabled card is selected", async () => {
+    const user = userEvent.setup();
+    const { cards, aiAction } = buildFourActionCards();
+
+    renderWithProviders(<SourceSelection actionCards={cards} />);
+
+    await user.click(screen.getByTestId("action-card-AI agent"));
+    expect(screen.getAllByRole("button", { name: "Connect" })).toHaveLength(1);
+
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+    expect(aiAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps disabled cards non-interactive and free of a connect button", async () => {
+    const user = userEvent.setup();
+    const { cards, restAction, grpcAction } = buildFourActionCards();
+
+    renderWithProviders(<SourceSelection actionCards={cards} />);
+
+    const restCard = screen.getByTestId("action-card-REST API");
+    const grpcCard = screen.getByTestId("action-card-gRPC");
+
+    expect(restCard).toHaveAttribute("aria-disabled", "true");
+    expect(grpcCard).toHaveAttribute("aria-disabled", "true");
+    expect(restCard).toHaveAccessibleName(/Coming soon/i);
+    expect(grpcCard).toHaveAccessibleName(/Coming soon/i);
+    expect(screen.queryByText("Coming soon")).not.toBeInTheDocument();
+
+    await user.click(restCard);
+    await user.click(grpcCard);
+
+    expect(restAction).not.toHaveBeenCalled();
+    expect(grpcAction).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("button", { name: "Connect" })).toHaveLength(1);
+  });
+  it("keeps every source selectable and explains its state", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({
+          gateways: [
+            {
+              id: "s-off",
+              name: "offline-src",
+              enabled: true,
+              reachable: false,
+              lastSeen: "2026-01-01T00:00:00Z",
+              visibility: "public",
+              tool_count: 4,
+            },
+            {
+              id: "s-draft",
+              name: "draft-src",
+              enabled: false,
+              reachable: false,
+              visibility: "public",
+              tool_count: 0,
+            },
+          ],
+        }),
+      ),
+      http.get("*/oauth/status", () => HttpResponse.json({})),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+
+    expect(await screen.findByText("offline-src")).toBeInTheDocument();
+    expect(screen.getByText("Offline")).toBeInTheDocument();
+    expect(screen.getByText("Inactive")).toBeInTheDocument();
+
+    // An unavailable source stays selectable: its components remain in the catalog.
+    for (const name of ["Select offline-src", "Select draft-src"]) {
+      expect(screen.getByRole("checkbox", { name })).toBeEnabled();
+    }
+  });
+
+  it("warns at submit only about selected sources with nothing to add", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({
+          gateways: [
+            {
+              id: "s-full",
+              name: "full-src",
+              enabled: true,
+              reachable: true,
+              visibility: "public",
+              tool_count: 3,
+            },
+            {
+              id: "s-empty",
+              name: "empty-src",
+              enabled: true,
+              reachable: true,
+              visibility: "public",
+              tool_count: 0,
+              resource_count: 0,
+              prompt_count: 0,
+            },
+          ],
+        }),
+      ),
+      http.get("*/oauth/status", () => HttpResponse.json({})),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+    await screen.findByText("full-src");
+
+    await user.click(screen.getByRole("checkbox", { name: "Select full-src" }));
+    expect(screen.queryByText(/no components to add yet/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "Select empty-src" }));
+    expect(screen.getByText(/empty-src has no components to add yet/)).toBeInTheDocument();
+
+    // Non-blocking: submitting stays available.
+    expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+  });
+
+  it("reports the selected source names to the caller", async () => {
+    const user = userEvent.setup();
+    const onSelectSources = vi.fn();
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({
+          gateways: [
+            {
+              id: "s-1",
+              name: "alpha",
+              enabled: true,
+              reachable: true,
+              visibility: "public",
+              tool_count: 1,
+            },
+          ],
+        }),
+      ),
+      http.get("*/oauth/status", () => HttpResponse.json({})),
+    );
+
+    renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        onSelectSources={onSelectSources}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+    await screen.findByText("alpha");
+    await user.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+
+    expect(onSelectSources).toHaveBeenCalledWith(["s-1"], { "s-1": "alpha" });
+  });
+
+  it("keeps the name of a selected source that has dropped out of the list", async () => {
+    const user = userEvent.setup();
+    const onSelectSources = vi.fn();
+    server.use(
+      http.get("*/v1/mcp-servers", () =>
+        HttpResponse.json({
+          gateways: [
+            { id: "s-1", name: "alpha", enabled: true, reachable: true, tool_count: 1 },
+            { id: "s-2", name: "beta", enabled: true, reachable: true, tool_count: 1 },
+          ],
+        }),
+      ),
+      http.get("*/oauth/status", () => HttpResponse.json({})),
+    );
+
+    const { rerender } = renderWithProviders(
+      <SourceSelection
+        actionCards={actionCards}
+        onSelectSources={onSelectSources}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Add tools, resources, and prompts from connected sources",
+      }),
+    );
+    await screen.findByText("beta");
+    await user.click(screen.getByRole("checkbox", { name: "Select beta" }));
+
+    // beta leaves the available list while it is still selected.
+    rerender(
+      <SourceSelection
+        actionCards={actionCards}
+        associatedMCPServerIds={["s-2"]}
+        onSelectSources={onSelectSources}
+        createServerActions={{ onBack: vi.fn(), onSkip: vi.fn() }}
+      />,
+    );
+    expect(screen.queryByText("beta")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+
+    expect(onSelectSources).toHaveBeenLastCalledWith(["s-2", "s-1"], {
+      "s-1": "alpha",
+      "s-2": "beta",
+    });
+  });
+});

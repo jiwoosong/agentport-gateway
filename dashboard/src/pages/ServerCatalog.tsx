@@ -1,0 +1,1381 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode, Ref } from "react";
+import { useIntl } from "react-intl";
+
+import {
+  disconnectCatalogGateway,
+  getGatewayImpactPreview,
+  registerCatalogServer,
+  testCatalogServer,
+  type GatewayImpactPreview,
+} from "@/api/catalog";
+import { ApiError } from "@/api/client";
+import { serversApi } from "@/api/servers";
+import { useAuth } from "@/auth/useAuth";
+import { CatalogApiKeyDialog } from "@/components/server-catalog/CatalogApiKeyDialog";
+import { CatalogOAuthForm } from "@/components/server-catalog/CatalogOAuthForm";
+import {
+  CatalogResults,
+  CatalogServerDetailsDialog,
+} from "@/components/server-catalog/CatalogResults";
+import {
+  CatalogToolbar,
+  type CatalogFilterSection,
+} from "@/components/server-catalog/CatalogToolbar";
+import { EmptyStatePlaceholder } from "@/components/dashboard/EmptyStatePlaceholder";
+import { ConfirmDialog } from "@/components/servers/ConfirmDialog";
+import { Button } from "@/components/ui/button";
+import { InlineNotification } from "@/components/ui/inline-notification";
+import { Loading } from "@/components/ui/loading";
+import type {
+  CatalogListResponse,
+  CatalogServer,
+  CatalogServerRegisterBody,
+} from "@/generated/types";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useOAuthStatuses } from "@/hooks/useOAuthStatuses";
+import { useQuery } from "@/hooks/useQuery";
+import { useRouter } from "@/router";
+import {
+  API_KEY_AUTH_TYPES,
+  getAuthTypeGroupId,
+  getOrderedAuthTypeGroups,
+  isCatalogOAuthServer,
+  normalizeAuthTypeFilterValue,
+  OAUTH_AUTH_TYPES,
+  OPEN_AUTH_TYPE,
+  type AuthTypeGroupId,
+} from "@/utils/catalogAuthTypes";
+import { getTagLabels } from "@/utils/tags";
+
+// TODO: Fetch subsequent pages when CatalogListResponse.total exceeds this MVP page limit.
+const CATALOG_PATH = "/v1/catalog?limit=1000";
+const PAGE_PATH = "/app/server-catalog";
+const SUPPORTED_AUTH_TYPES = [OPEN_AUTH_TYPE, ...API_KEY_AUTH_TYPES, ...OAUTH_AUTH_TYPES];
+const SUPPORTED_AUTH_TYPE_SET = new Set(SUPPORTED_AUTH_TYPES);
+const PAGE_HEADING_ID = "server-catalog-heading";
+
+interface CatalogFilters {
+  search: string;
+  category: string[];
+  provider: string[];
+  // Group ids ("open" | "apiKey"), not raw catalog auth_type values.
+  authType: string[];
+  tags: string[];
+  installedOnly: boolean;
+}
+
+interface RegistrationNotification {
+  id: string;
+  type: "success" | "error" | "info";
+  message: string;
+  retryCatalogServer?: CatalogServer;
+}
+
+interface RegistrationResult {
+  success: boolean;
+  gatewayId?: string;
+}
+
+interface RegistrationReporting {
+  // Destination for failures. Defaults to the page notification stack.
+  reportNotification?: (notification: RegistrationNotification, shouldFocus?: boolean) => void;
+  // Diverts add failures away from reportNotification, onto the card that failed.
+  onAddFailure?: (server: CatalogServer, message: string) => void;
+}
+
+type ImpactPreviewStatus = "idle" | "loading" | "loaded" | "error";
+
+const DISCONNECT_POLL_TIMEOUT_MS = 30_000;
+const DEFAULT_DISCONNECT_POLL_MS = 1_000;
+
+class DisconnectPollTimeoutError extends Error {
+  constructor() {
+    super("Catalog disconnect did not finish in time");
+    this.name = "DisconnectPollTimeoutError";
+  }
+}
+
+type QueryUpdateValue = string | string[] | boolean | null;
+
+function getQuery(path: string): string {
+  const queryIndex = path.indexOf("?");
+  return queryIndex === -1 ? "" : path.slice(queryIndex + 1);
+}
+
+function readMulti(params: URLSearchParams, key: string): string[] {
+  return [...new Set(params.getAll(key).filter(Boolean))];
+}
+
+function parseAuthTypeFilter(params: URLSearchParams): string[] {
+  // Accepts both group ids and the raw catalog values a link shared before this
+  // grouping existed would carry (e.g. ?auth_type=API+Key), so old links keep matching.
+  const values = readMulti(params, "auth_type")
+    .map(normalizeAuthTypeFilterValue)
+    .filter((value): value is AuthTypeGroupId => value !== null);
+  return [...new Set(values)];
+}
+
+function parseFilters(path: string): CatalogFilters {
+  const params = new URLSearchParams(getQuery(path));
+
+  return {
+    search: params.get("search") ?? "",
+    category: readMulti(params, "category"),
+    provider: readMulti(params, "provider"),
+    authType: parseAuthTypeFilter(params),
+    tags: readMulti(params, "tags"),
+    installedOnly: params.get("show_registered_only") === "true",
+  };
+}
+
+function useCatalogFilters() {
+  const { path, navigate } = useRouter();
+  const filters = useMemo(() => parseFilters(path), [path]);
+
+  const updateQuery = useCallback(
+    (updates: Record<string, QueryUpdateValue>) => {
+      const params = new URLSearchParams(getQuery(path));
+
+      Object.entries(updates).forEach(([key, value]) => {
+        params.delete(key);
+        if (Array.isArray(value)) {
+          value.forEach((item) => params.append(key, item));
+        } else if (typeof value === "boolean") {
+          if (value) params.set(key, "true");
+        } else if (value) {
+          params.set(key, value);
+        }
+      });
+
+      const query = params.toString();
+      navigate(query ? `${PAGE_PATH}?${query}` : PAGE_PATH, { replace: true });
+    },
+    [navigate, path],
+  );
+
+  const toggleFilterOption = useCallback(
+    (section: CatalogFilterSection, option: string, checked: boolean) => {
+      const current = filters[section];
+      updateQuery({
+        [section === "authType" ? "auth_type" : section]: checked
+          ? [...current, option]
+          : current.filter((item) => item !== option),
+      });
+    },
+    [filters, updateQuery],
+  );
+
+  const clearFilterSection = useCallback(
+    (section: CatalogFilterSection) =>
+      updateQuery({ [section === "authType" ? "auth_type" : section]: [] }),
+    [updateQuery],
+  );
+
+  // Drops the four popover sections in one navigation. The search box and the
+  // connected-only toggle live outside the popover and are left alone.
+  const clearAllFilters = useCallback(
+    () => updateQuery({ category: [], provider: [], auth_type: [], tags: [] }),
+    [updateQuery],
+  );
+
+  return { filters, updateQuery, toggleFilterOption, clearFilterSection, clearAllFilters };
+}
+
+function filterSupportedServers(
+  catalogServers: CatalogServer[],
+  filters: CatalogFilters,
+): CatalogServer[] {
+  const search = filters.search.trim().toLocaleLowerCase();
+
+  return catalogServers.filter((server) => {
+    if (filters.category.length > 0 && !filters.category.includes(server.category ?? "")) {
+      return false;
+    }
+    if (filters.provider.length > 0 && !filters.provider.includes(server.provider ?? "")) {
+      return false;
+    }
+    if (filters.authType.length > 0) {
+      const groupId = getAuthTypeGroupId(server.auth_type);
+      if (!groupId || !filters.authType.includes(groupId)) return false;
+    }
+    if (filters.installedOnly && !server.is_registered) return false;
+    const serverTags = getTagLabels(server.tags ?? []);
+    if (filters.tags.length > 0 && !filters.tags.some((tag) => serverTags.includes(tag))) {
+      return false;
+    }
+
+    if (!search) return true;
+    return `${server.name} ${server.description}`.toLocaleLowerCase().includes(search);
+  });
+}
+
+function sortedUnique(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))].sort();
+}
+
+function getSupportedServers(servers: CatalogServer[]): CatalogServer[] {
+  return servers.filter((server) => SUPPORTED_AUTH_TYPE_SET.has(server.auth_type));
+}
+
+function setCatalogServerRegistration(
+  catalog: CatalogListResponse | undefined,
+  serverId: string,
+  isRegistered: boolean,
+  gatewayId?: string | null,
+): CatalogListResponse | undefined {
+  if (!catalog) return catalog;
+
+  const serverIndex = catalog.servers.findIndex((server) => server.id === serverId);
+  if (
+    serverIndex === -1 ||
+    (catalog.servers[serverIndex].is_registered === isRegistered && gatewayId === undefined)
+  ) {
+    return catalog;
+  }
+
+  const servers = [...catalog.servers];
+  servers[serverIndex] = {
+    ...servers[serverIndex],
+    is_registered: isRegistered,
+    ...(gatewayId === undefined ? {} : { gateway_id: gatewayId }),
+  };
+  return { ...catalog, servers };
+}
+
+function setCatalogServerOAuthPending(
+  catalog: CatalogListResponse | undefined,
+  serverId: string,
+  requiresOAuthConfig: boolean,
+): CatalogListResponse | undefined {
+  if (!catalog) return catalog;
+  const serverIndex = catalog.servers.findIndex((server) => server.id === serverId);
+  if (serverIndex === -1) return catalog;
+
+  const servers = [...catalog.servers];
+  servers[serverIndex] = { ...servers[serverIndex], requires_oauth_config: requiresOAuthConfig };
+  return { ...catalog, servers };
+}
+
+function getRetryAfterMs(value: string | null): number {
+  const seconds = Number(value);
+  const dateDelay = value ? Date.parse(value) - Date.now() : Number.NaN;
+  const delayMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : dateDelay;
+
+  return Number.isFinite(delayMs) && delayMs > 0
+    ? Math.min(DISCONNECT_POLL_TIMEOUT_MS, Math.max(250, delayMs))
+    : DEFAULT_DISCONNECT_POLL_MS;
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      window.clearTimeout(timeoutId);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function usePendingIds() {
+  const pendingIdsRef = useRef(new Set<string>());
+  const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set());
+
+  const begin = useCallback((id: string): boolean => {
+    if (pendingIdsRef.current.has(id)) return false;
+    pendingIdsRef.current.add(id);
+    setPendingIds(new Set(pendingIdsRef.current));
+    return true;
+  }, []);
+
+  const end = useCallback((id: string) => {
+    pendingIdsRef.current.delete(id);
+    setPendingIds(new Set(pendingIdsRef.current));
+  }, []);
+
+  const isPending = useCallback((id: string) => pendingIdsRef.current.has(id), []);
+
+  return useMemo(
+    () => ({ pendingIds, begin, end, isPending }),
+    [begin, end, isPending, pendingIds],
+  );
+}
+
+function removeCatalogServer(
+  catalog: CatalogListResponse | undefined,
+  serverId: string,
+): CatalogListResponse | undefined {
+  if (!catalog) return catalog;
+
+  const servers = catalog.servers.filter((server) => server.id !== serverId);
+  if (servers.length === catalog.servers.length) return catalog;
+
+  return {
+    ...catalog,
+    servers,
+    total: Math.max(0, catalog.total - 1),
+  };
+}
+
+function CatalogPageLayout({
+  children,
+  headingRef,
+}: {
+  children: ReactNode;
+  headingRef: Ref<HTMLHeadingElement>;
+}) {
+  const intl = useIntl();
+
+  return (
+    <section className="p-6" aria-labelledby={PAGE_HEADING_ID}>
+      <h1
+        ref={headingRef}
+        id={PAGE_HEADING_ID}
+        tabIndex={-1}
+        className="text-base font-semibold text-foreground"
+      >
+        {intl.formatMessage({ id: "mcpServer.catalog.title" })}
+      </h1>
+      {children}
+    </section>
+  );
+}
+
+export function ServerCatalog() {
+  const intl = useIntl();
+  const { hasPermission, permissionsLoading } = useAuth();
+  const [selectedServer, setSelectedServer] = useState<CatalogServer | null>(null);
+  const {
+    pendingIds: addingServerIds,
+    begin: beginAdding,
+    end: endAdding,
+    isPending: isAdding,
+  } = usePendingIds();
+  const {
+    pendingIds: testingServerIds,
+    begin: beginTesting,
+    end: endTesting,
+    isPending: isTesting,
+  } = usePendingIds();
+  const {
+    pendingIds: disconnectingServerIds,
+    begin: beginDisconnecting,
+    end: endDisconnecting,
+    isPending: isDisconnecting,
+  } = usePendingIds();
+  const [registrationNotifications, setRegistrationNotifications] = useState<
+    RegistrationNotification[]
+  >([]);
+  const [addErrors, setAddErrors] = useState<Record<string, string>>({});
+  const addErrorsRef = useRef<Record<string, string>>({});
+  const [addErrorAnnouncement, setAddErrorAnnouncement] = useState("");
+  const [apiKeyDialogNotification, setApiKeyDialogNotification] = useState<
+    RegistrationNotification | undefined
+  >();
+  const [disconnectServer, setDisconnectServer] = useState<CatalogServer | null>(null);
+  const [impactPreview, setImpactPreview] = useState<GatewayImpactPreview | null>(null);
+  const [impactPreviewStatus, setImpactPreviewStatus] = useState<ImpactPreviewStatus>("idle");
+  const impactRequestIdRef = useRef(0);
+  const disconnectPollAbortControllersRef = useRef(new Map<string, AbortController>());
+  const [apiKeyServer, setApiKeyServer] = useState<CatalogServer | null>(null);
+  const [oauthServer, setOAuthServer] = useState<CatalogServer | null>(null);
+  const [oauthFormNotification, setOAuthFormNotification] = useState<
+    RegistrationNotification | undefined
+  >();
+  const [oauthAuthorizing, setOAuthAuthorizing] = useState(false);
+  const [pendingOAuthGatewayId, setPendingOAuthGatewayId] = useState<string | null>(null);
+  const [focusActionsForServerId, setFocusActionsForServerId] = useState<string | null>(null);
+  const lastViewTriggerRef = useRef<HTMLElement | null>(null);
+  const pageHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const registrationNotificationRefs = useRef(new Map<string, HTMLDivElement>());
+  const notificationToFocusRef = useRef<string | null>(null);
+  const shouldRedirectDisconnectCloseFocusRef = useRef(false);
+  const { data, error, isLoading, refetch, setData } = useQuery<CatalogListResponse>(CATALOG_PATH);
+  const canReadOAuthStatuses = !permissionsLoading && hasPermission("gateways.read");
+  const canUpdateServer = !permissionsLoading && hasPermission("gateways.update");
+  const oauthGatewayIds = useMemo(
+    () =>
+      (data?.servers ?? [])
+        .filter(
+          (server) => server.is_registered && server.gateway_id && isCatalogOAuthServer(server),
+        )
+        .map((server) => server.gateway_id!),
+    [data?.servers],
+  );
+  const {
+    entries: oauthStatuses,
+    reload: reloadOAuthStatuses,
+    retry: retryOAuthStatus,
+  } = useOAuthStatuses(oauthGatewayIds, { enabled: canReadOAuthStatuses });
+  const canTest = canReadOAuthStatuses;
+  const canDisconnect = !permissionsLoading && hasPermission("gateways.delete");
+  const { filters, updateQuery, toggleFilterOption, clearFilterSection, clearAllFilters } =
+    useCatalogFilters();
+  const [search, setSearch] = useState(filters.search);
+  const debouncedSearch = useDebouncedValue(search, 300);
+
+  useEffect(() => {
+    setSearch(filters.search);
+  }, [filters.search]);
+
+  useEffect(() => {
+    if (debouncedSearch !== filters.search) {
+      updateQuery({ search: debouncedSearch || null });
+    }
+  }, [debouncedSearch, filters.search, updateQuery]);
+
+  useEffect(() => {
+    const notificationId = notificationToFocusRef.current;
+    if (!notificationId) return;
+
+    notificationToFocusRef.current = null;
+    registrationNotificationRefs.current.get(notificationId)?.focus();
+  }, [registrationNotifications]);
+
+  useEffect(
+    () => () => {
+      impactRequestIdRef.current += 1;
+      disconnectPollAbortControllersRef.current.forEach((controller) => controller.abort());
+      disconnectPollAbortControllersRef.current.clear();
+    },
+    [],
+  );
+
+  const showRegistrationNotification = useCallback(
+    (notification: RegistrationNotification, shouldFocus = false) => {
+      if (shouldFocus) notificationToFocusRef.current = notification.id;
+      setRegistrationNotifications((current) => [
+        ...current.filter((existing) => existing.id !== notification.id),
+        notification,
+      ]);
+    },
+    [],
+  );
+
+  const showAddError = useCallback(
+    (server: CatalogServer, message: string) => {
+      addErrorsRef.current = { ...addErrorsRef.current, [server.id]: message };
+      setAddErrors(addErrorsRef.current);
+      setAddErrorAnnouncement(
+        intl.formatMessage(
+          { id: "mcpServer.catalog.addFailed.announcement" },
+          {
+            name: server.name,
+            message,
+          },
+        ),
+      );
+    },
+    [intl],
+  );
+
+  // Returns early for any other server, whose failure is still on its card.
+  const clearAddError = useCallback((serverId: string) => {
+    if (!(serverId in addErrorsRef.current)) return;
+    const next = { ...addErrorsRef.current };
+    delete next[serverId];
+    addErrorsRef.current = next;
+    setAddErrors(next);
+    // Emptied on retry, so a repeat failure is still a change to announce.
+    setAddErrorAnnouncement("");
+  }, []);
+
+  const dismissRegistrationNotification = useCallback((notificationId: string) => {
+    setRegistrationNotifications((current) =>
+      current.filter((notification) => notification.id !== notificationId),
+    );
+  }, []);
+
+  const refreshOAuthStatus = useCallback(
+    (gatewayId: string) => reloadOAuthStatuses([gatewayId]),
+    [reloadOAuthStatuses],
+  );
+
+  const refreshGatewayData = useCallback(
+    async (gatewayId: string, server: Pick<CatalogServer, "id" | "name">) => {
+      const componentRefreshPromise = canUpdateServer
+        ? serversApi.fetchToolsAfterOAuth(gatewayId)
+        : Promise.resolve(undefined);
+      const [, componentRefresh] = await Promise.allSettled([
+        refreshOAuthStatus(gatewayId),
+        componentRefreshPromise,
+      ]);
+      if (componentRefresh.status === "rejected") {
+        showRegistrationNotification({
+          id: `oauth:${server.id}`,
+          type: "info",
+          message: intl.formatMessage(
+            { id: "mcpServer.catalog.oauth.authorizedToolsPending" },
+            { name: server.name },
+          ),
+        });
+      }
+    },
+    [canUpdateServer, intl, refreshOAuthStatus, showRegistrationNotification],
+  );
+
+  useEffect(() => {
+    if (!focusActionsForServerId || oauthServer) return;
+
+    const actions =
+      document.getElementById(`catalog-server-actions-${focusActionsForServerId}`) ??
+      document.getElementById(`catalog-server-add-${focusActionsForServerId}`);
+    if (actions instanceof HTMLButtonElement) actions.focus();
+    else pageHeadingRef.current?.focus();
+    setFocusActionsForServerId(null);
+  }, [data, focusActionsForServerId, oauthServer]);
+
+  // Only the search box filters ahead of the URL, so the grid can react to the
+  // debounced value. Category, provider and tag selections are committed to the
+  // URL the moment they are ticked in the filters popover.
+  const activeFilters = useMemo(() => ({ ...filters, search }), [filters, search]);
+
+  const supportedServers = useMemo(() => getSupportedServers(data?.servers ?? []), [data?.servers]);
+  const servers = useMemo(
+    () => filterSupportedServers(supportedServers, activeFilters),
+    [supportedServers, activeFilters],
+  );
+  const categoryOptions = useMemo(
+    () => sortedUnique(supportedServers.map((server) => server.category)),
+    [supportedServers],
+  );
+  const providerOptions = useMemo(
+    () => sortedUnique(supportedServers.map((server) => server.provider)),
+    [supportedServers],
+  );
+  const tagOptions = useMemo(
+    () => sortedUnique(supportedServers.flatMap((server) => getTagLabels(server.tags ?? []))),
+    [supportedServers],
+  );
+  const authTypeOptions = useMemo(() => {
+    const presentGroupIds = new Set(
+      supportedServers
+        .map((server) => getAuthTypeGroupId(server.auth_type))
+        .filter((groupId): groupId is AuthTypeGroupId => groupId !== null),
+    );
+    return getOrderedAuthTypeGroups()
+      .filter((group) => presentGroupIds.has(group.id))
+      .map((group) => ({ value: group.id, label: intl.formatMessage({ id: group.labelId }) }));
+  }, [supportedServers, intl]);
+  const hasSupportedServers = supportedServers.length > 0;
+  const hasConnectedServers = supportedServers.some((server) => server.is_registered);
+  const emptyStateMessageId = !hasSupportedServers
+    ? "mcpServer.catalog.empty"
+    : filters.installedOnly && !hasConnectedServers
+      ? "mcpServer.catalog.noneConnected"
+      : "mcpServer.catalog.noResults";
+  const activeFilterCount =
+    filters.category.length +
+    filters.provider.length +
+    filters.authType.length +
+    filters.tags.length;
+
+  const handleView = useCallback((server: CatalogServer, trigger: HTMLElement) => {
+    lastViewTriggerRef.current = trigger;
+    setSelectedServer(server);
+  }, []);
+
+  const refreshCatalogSilently = useCallback(async () => {
+    try {
+      await refetch();
+    } catch {
+      // The mutation result remains reflected in the cached data. A later
+      // successful fetch will replace that optimistic value authoritatively.
+    }
+  }, [refetch]);
+
+  const registerServer = useCallback(
+    async (
+      server: CatalogServer,
+      body?: CatalogServerRegisterBody,
+      {
+        reportNotification = showRegistrationNotification,
+        onAddFailure,
+      }: RegistrationReporting = {},
+    ): Promise<RegistrationResult> => {
+      if (!beginAdding(server.id)) return { success: false };
+      dismissRegistrationNotification(`add:${server.id}`);
+      clearAddError(server.id);
+      const reportAddFailure = (message: string) => {
+        if (onAddFailure) onAddFailure(server, message);
+        else reportNotification({ id: `add:${server.id}`, type: "error", message });
+      };
+      try {
+        const result = body
+          ? await registerCatalogServer(server.id, body)
+          : await registerCatalogServer(server.id);
+        if (!result.success) {
+          reportAddFailure(
+            result.message || intl.formatMessage({ id: "mcpServer.catalog.addError" }),
+          );
+          return { success: false };
+        }
+
+        setData((current) =>
+          setCatalogServerRegistration(current, server.id, true, result.server_id),
+        );
+        void refreshCatalogSilently();
+        return { success: true, gatewayId: result.server_id };
+      } catch (registrationError) {
+        if (registrationError instanceof ApiError && registrationError.status === 409) {
+          // Terminal outcome, not a retryable error: always surface on the grid (matching the
+          // "connected" card state refreshCatalogSilently produces) and report success so the
+          // dialog closes instead of sitting open behind its own notification.
+          showRegistrationNotification({
+            id: `add:${server.id}`,
+            type: "success",
+            message: intl.formatMessage(
+              { id: "mcpServer.catalog.alreadyConnected" },
+              { name: server.name },
+            ),
+          });
+          await refreshCatalogSilently();
+          return { success: true };
+        }
+
+        if (registrationError instanceof ApiError && registrationError.status === 404) {
+          setData((current) => removeCatalogServer(current, server.id));
+          reportNotification(
+            {
+              id: `add:${server.id}`,
+              type: "error",
+              message: intl.formatMessage(
+                { id: "mcpServer.catalog.addNotFound" },
+                { name: server.name },
+              ),
+            },
+            true,
+          );
+          await refreshCatalogSilently();
+          return { success: false };
+        }
+
+        reportAddFailure(intl.formatMessage({ id: "mcpServer.catalog.addError" }));
+        return { success: false };
+      } finally {
+        endAdding(server.id);
+      }
+    },
+    [
+      beginAdding,
+      clearAddError,
+      dismissRegistrationNotification,
+      endAdding,
+      intl,
+      refreshCatalogSilently,
+      setData,
+      showRegistrationNotification,
+    ],
+  );
+
+  const handleAdd = useCallback(
+    (server: CatalogServer) => {
+      if (API_KEY_AUTH_TYPES.has(server.auth_type)) {
+        setApiKeyDialogNotification(undefined);
+        setApiKeyServer(server);
+        return;
+      }
+      if (OAUTH_AUTH_TYPES.has(server.auth_type)) {
+        setOAuthFormNotification(undefined);
+        setOAuthServer(server);
+        return;
+      }
+      if (server.auth_type === OPEN_AUTH_TYPE) {
+        void registerServer(server, undefined, { onAddFailure: showAddError });
+      }
+    },
+    [registerServer, showAddError],
+  );
+
+  const handleApiKeySubmit = useCallback(
+    async (body: CatalogServerRegisterBody) => {
+      if (!apiKeyServer) return false;
+      setApiKeyDialogNotification(undefined);
+      // The dialog notification has no focus-ref registry like the grid's does, and doesn't
+      // need one: InlineNotification already uses role="alert"/"status" for a11y announcement,
+      // so shouldFocus is intentionally dropped here rather than passed to a state setter.
+      const { success } = await registerServer(apiKeyServer, body, {
+        reportNotification: (notification) => setApiKeyDialogNotification(notification),
+      });
+      if (success) setFocusActionsForServerId(apiKeyServer.id);
+      return success;
+    },
+    [apiKeyServer, registerServer],
+  );
+
+  const handleOAuthSubmit = useCallback(
+    async (body: CatalogServerRegisterBody) => {
+      if (!oauthServer) return false;
+      setOAuthFormNotification(undefined);
+      let authWindow: Window;
+      try {
+        // Must happen before the first await below. Browsers only allow popups
+        // opened directly from this form submit gesture.
+        authWindow = serversApi.openOAuthAuthorizationPopup();
+      } catch (error) {
+        setOAuthFormNotification({
+          id: `oauth:${oauthServer.id}`,
+          type: "info",
+          message:
+            error instanceof Error
+              ? error.message
+              : intl.formatMessage({ id: "mcpServer.catalog.oauth.authorizationError" }),
+        });
+        return false;
+      }
+
+      let gatewayId = pendingOAuthGatewayId;
+      if (!gatewayId) {
+        const registration = await registerServer(oauthServer, body, {
+          reportNotification: (notification) => setOAuthFormNotification(notification),
+        });
+        if (!registration.success) {
+          authWindow.close();
+          return false;
+        }
+        if (!registration.gatewayId) {
+          authWindow.close();
+          return true;
+        }
+        gatewayId = registration.gatewayId;
+        setPendingOAuthGatewayId(gatewayId);
+      }
+
+      setOAuthAuthorizing(true);
+      setOAuthFormNotification(undefined);
+      try {
+        await serversApi.triggerOAuthAuthorization(gatewayId, authWindow);
+        if (canUpdateServer) await serversApi.toggleEnabled(gatewayId, true);
+        await refreshGatewayData(gatewayId, oauthServer);
+        setData((current) => setCatalogServerOAuthPending(current, oauthServer.id, false));
+        void refreshCatalogSilently();
+        setPendingOAuthGatewayId(null);
+        return true;
+      } catch (error) {
+        authWindow.close();
+        setOAuthFormNotification({
+          id: `oauth:${oauthServer.id}`,
+          type: "info",
+          message:
+            error instanceof Error
+              ? error.message
+              : intl.formatMessage({ id: "mcpServer.catalog.oauth.authorizationError" }),
+        });
+        return false;
+      } finally {
+        setOAuthAuthorizing(false);
+      }
+    },
+    [
+      intl,
+      canUpdateServer,
+      oauthServer,
+      pendingOAuthGatewayId,
+      refreshGatewayData,
+      refreshCatalogSilently,
+      registerServer,
+      setData,
+    ],
+  );
+
+  const handleAuthorize = useCallback(
+    async (server: CatalogServer) => {
+      if (!server.gateway_id || !beginAdding(server.id)) return;
+      dismissRegistrationNotification(`oauth:${server.id}`);
+      try {
+        await serversApi.triggerOAuthAuthorization(server.gateway_id);
+        if (canUpdateServer) await serversApi.toggleEnabled(server.gateway_id, true);
+        await refreshGatewayData(server.gateway_id, server);
+        setData((current) => setCatalogServerOAuthPending(current, server.id, false));
+        void refreshCatalogSilently();
+      } catch (error) {
+        showRegistrationNotification({
+          id: `oauth:${server.id}`,
+          type: "info",
+          message:
+            error instanceof Error
+              ? error.message
+              : intl.formatMessage({ id: "mcpServer.catalog.oauth.authorizationError" }),
+        });
+      } finally {
+        endAdding(server.id);
+      }
+    },
+    [
+      beginAdding,
+      canUpdateServer,
+      dismissRegistrationNotification,
+      endAdding,
+      intl,
+      refreshGatewayData,
+      refreshCatalogSilently,
+      setData,
+      showRegistrationNotification,
+    ],
+  );
+
+  const handleTest = useCallback(
+    async (server: CatalogServer) => {
+      if (
+        server.requires_oauth_config ||
+        isAdding(server.id) ||
+        isDisconnecting(server.id) ||
+        !beginTesting(server.id)
+      ) {
+        return;
+      }
+
+      dismissRegistrationNotification(`test:${server.id}`);
+
+      try {
+        const result = await testCatalogServer(server.url);
+        if (!result) {
+          showRegistrationNotification(
+            {
+              id: `test:${server.id}`,
+              type: "error",
+              message: intl.formatMessage(
+                { id: "mcpServer.catalog.testError" },
+                { name: server.name },
+              ),
+            },
+            true,
+          );
+          return;
+        }
+
+        const statusCode = result.statusCode ?? 0;
+        const succeeded = statusCode >= 200 && statusCode < 300;
+        showRegistrationNotification(
+          {
+            id: `test:${server.id}`,
+            type: succeeded ? "success" : "error",
+            message: intl.formatMessage(
+              {
+                id: succeeded ? "mcpServer.catalog.testSuccess" : "mcpServer.catalog.testFailure",
+              },
+              { name: server.name, statusCode, latencyMs: result.latencyMs ?? 0 },
+            ),
+          },
+          true,
+        );
+      } catch {
+        showRegistrationNotification(
+          {
+            id: `test:${server.id}`,
+            type: "error",
+            message: intl.formatMessage(
+              { id: "mcpServer.catalog.testError" },
+              { name: server.name },
+            ),
+          },
+          true,
+        );
+      } finally {
+        endTesting(server.id);
+      }
+    },
+    [
+      beginTesting,
+      dismissRegistrationNotification,
+      endTesting,
+      intl,
+      isAdding,
+      isDisconnecting,
+      showRegistrationNotification,
+    ],
+  );
+
+  const handleDisconnect = useCallback(
+    (server: CatalogServer) => {
+      if (
+        !server.gateway_id ||
+        isAdding(server.id) ||
+        isTesting(server.id) ||
+        isDisconnecting(server.id)
+      ) {
+        return;
+      }
+
+      setDisconnectServer(server);
+      setImpactPreview(null);
+      setImpactPreviewStatus("idle");
+      const requestId = ++impactRequestIdRef.current;
+      if (!canDisconnect) return;
+
+      setImpactPreviewStatus("loading");
+      void getGatewayImpactPreview(server.gateway_id)
+        .then((preview) => {
+          if (impactRequestIdRef.current === requestId) {
+            setImpactPreview(preview);
+            setImpactPreviewStatus("loaded");
+          }
+        })
+        // Preview is optional. A permission or ownership race must not disclose
+        // the protected list or block a deletion the caller may perform.
+        .catch(() => {
+          if (impactRequestIdRef.current === requestId) {
+            setImpactPreview(null);
+            setImpactPreviewStatus("error");
+          }
+        });
+    },
+    [canDisconnect, isAdding, isDisconnecting, isTesting],
+  );
+
+  const handleDisconnectDialogOpenChange = useCallback((open: boolean) => {
+    if (open) return;
+    impactRequestIdRef.current += 1;
+    setDisconnectServer(null);
+    setImpactPreview(null);
+    setImpactPreviewStatus("idle");
+  }, []);
+
+  const waitForCatalogDisconnect = useCallback(
+    async (catalogId: string, initialDelayMs: number, signal: AbortSignal) => {
+      const deadline = Date.now() + DISCONNECT_POLL_TIMEOUT_MS;
+      let delayMs = initialDelayMs;
+      let consecutivePollErrors = 0;
+
+      while (Date.now() < deadline) {
+        await delay(delayMs, signal);
+        try {
+          const catalog = await refetch();
+          const server = catalog.servers.find((candidate) => candidate.id === catalogId);
+          if (!server?.is_registered || !server.gateway_id) return;
+          consecutivePollErrors = 0;
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          consecutivePollErrors += 1;
+          if (
+            (error instanceof ApiError && error.status >= 400 && error.status < 500) ||
+            consecutivePollErrors >= 3
+          ) {
+            throw error;
+          }
+          // Deletion has already been accepted. Keep polling through transient
+          // catalog failures, but surface persistent or authorization failures.
+        }
+        delayMs = DEFAULT_DISCONNECT_POLL_MS;
+      }
+
+      throw new DisconnectPollTimeoutError();
+    },
+    [refetch],
+  );
+
+  const handleDisconnectStatusRetry = useCallback(
+    async (server: CatalogServer) => {
+      if (!beginDisconnecting(server.id)) return;
+
+      let pollController: AbortController | null = null;
+      dismissRegistrationNotification(`disconnect:${server.id}`);
+      try {
+        pollController = new AbortController();
+        disconnectPollAbortControllersRef.current.set(server.id, pollController);
+        await waitForCatalogDisconnect(
+          server.id,
+          DEFAULT_DISCONNECT_POLL_MS,
+          pollController.signal,
+        );
+        showRegistrationNotification(
+          {
+            id: `disconnect:${server.id}`,
+            type: "success",
+            message: intl.formatMessage(
+              { id: "mcpServer.catalog.disconnectSuccess" },
+              { name: server.name },
+            ),
+          },
+          true,
+        );
+      } catch (error) {
+        if (isAbortError(error)) return;
+        showRegistrationNotification(
+          {
+            id: `disconnect:${server.id}`,
+            type: error instanceof DisconnectPollTimeoutError ? "info" : "error",
+            message: intl.formatMessage(
+              {
+                id:
+                  error instanceof DisconnectPollTimeoutError
+                    ? "mcpServer.catalog.disconnectPending"
+                    : "mcpServer.catalog.disconnectError",
+              },
+              { name: server.name },
+            ),
+            ...(error instanceof DisconnectPollTimeoutError ? { retryCatalogServer: server } : {}),
+          },
+          true,
+        );
+      } finally {
+        if (disconnectPollAbortControllersRef.current.get(server.id) === pollController) {
+          disconnectPollAbortControllersRef.current.delete(server.id);
+        }
+        endDisconnecting(server.id);
+      }
+    },
+    [
+      beginDisconnecting,
+      dismissRegistrationNotification,
+      endDisconnecting,
+      intl,
+      showRegistrationNotification,
+      waitForCatalogDisconnect,
+    ],
+  );
+
+  const confirmDisconnect = useCallback(async () => {
+    const gatewayId = disconnectServer?.gateway_id;
+    if (!disconnectServer || !gatewayId || !beginDisconnecting(disconnectServer.id)) {
+      return;
+    }
+
+    const server = disconnectServer;
+    let pollController: AbortController | null = null;
+
+    try {
+      const response = await disconnectCatalogGateway(gatewayId);
+      if (response.status === 202) {
+        setDisconnectServer(null);
+        setImpactPreview(null);
+        setImpactPreviewStatus("idle");
+        showRegistrationNotification(
+          {
+            id: `disconnect:${server.id}`,
+            type: "info",
+            message: intl.formatMessage(
+              { id: "mcpServer.catalog.disconnectAccepted" },
+              { name: server.name },
+            ),
+          },
+          true,
+        );
+        pollController = new AbortController();
+        disconnectPollAbortControllersRef.current.set(server.id, pollController);
+        await waitForCatalogDisconnect(
+          server.id,
+          getRetryAfterMs(response.headers.get("Retry-After")),
+          pollController.signal,
+        );
+      } else {
+        setData((current) => setCatalogServerRegistration(current, server.id, false, null));
+        void refreshCatalogSilently();
+        shouldRedirectDisconnectCloseFocusRef.current = true;
+      }
+      impactRequestIdRef.current += 1;
+      setDisconnectServer(null);
+      setImpactPreview(null);
+      showRegistrationNotification(
+        {
+          id: `disconnect:${server.id}`,
+          type: "success",
+          message: intl.formatMessage(
+            { id: "mcpServer.catalog.disconnectSuccess" },
+            { name: server.name },
+          ),
+        },
+        true,
+      );
+    } catch (error) {
+      if (isAbortError(error)) return;
+      if (error instanceof DisconnectPollTimeoutError) {
+        setDisconnectServer(null);
+        setImpactPreview(null);
+      }
+      showRegistrationNotification(
+        {
+          id: `disconnect:${server.id}`,
+          type: error instanceof DisconnectPollTimeoutError ? "info" : "error",
+          message: intl.formatMessage(
+            {
+              id:
+                error instanceof DisconnectPollTimeoutError
+                  ? "mcpServer.catalog.disconnectPending"
+                  : "mcpServer.catalog.disconnectError",
+            },
+            { name: server.name },
+          ),
+          ...(error instanceof DisconnectPollTimeoutError ? { retryCatalogServer: server } : {}),
+        },
+        true,
+      );
+    } finally {
+      if (disconnectPollAbortControllersRef.current.get(server.id) === pollController) {
+        disconnectPollAbortControllersRef.current.delete(server.id);
+      }
+      endDisconnecting(server.id);
+    }
+  }, [
+    beginDisconnecting,
+    disconnectServer,
+    endDisconnecting,
+    intl,
+    refreshCatalogSilently,
+    setData,
+    showRegistrationNotification,
+    waitForCatalogDisconnect,
+  ]);
+
+  const handleDetailsOpenChange = useCallback((open: boolean) => {
+    if (open) return;
+    setSelectedServer(null);
+    window.setTimeout(() => lastViewTriggerRef.current?.focus(), 0);
+  }, []);
+
+  const handleDisconnectDialogCloseAutoFocus = useCallback((event: Event) => {
+    if (!shouldRedirectDisconnectCloseFocusRef.current) return;
+
+    // A synchronous delete swaps the actions trigger for Add, so Radix cannot
+    // restore focus to the removed trigger.
+    event.preventDefault();
+    shouldRedirectDisconnectCloseFocusRef.current = false;
+    pageHeadingRef.current?.focus();
+  }, []);
+
+  const handleRegistrationNotificationDismiss = useCallback(
+    (notificationId: string) => {
+      const notification = registrationNotificationRefs.current.get(notificationId);
+      const shouldRestoreFocus = notification?.contains(notification.ownerDocument.activeElement);
+      dismissRegistrationNotification(notificationId);
+      if (shouldRestoreFocus) {
+        window.setTimeout(() => pageHeadingRef.current?.focus(), 0);
+      }
+    },
+    [dismissRegistrationNotification],
+  );
+
+  const closeOAuthForm = useCallback(() => {
+    if (!oauthServer) return;
+    setFocusActionsForServerId(oauthServer.id);
+    setOAuthServer(null);
+    setOAuthFormNotification(undefined);
+    setPendingOAuthGatewayId(null);
+  }, [oauthServer]);
+
+  if (oauthServer) {
+    return (
+      <CatalogPageLayout headingRef={pageHeadingRef}>
+        <CatalogOAuthForm
+          key={oauthServer.id}
+          server={oauthServer}
+          onCancel={closeOAuthForm}
+          onSuccess={closeOAuthForm}
+          onSubmit={handleOAuthSubmit}
+          isSubmitting={addingServerIds.has(oauthServer.id) || oauthAuthorizing}
+          notification={oauthFormNotification}
+          onDismissNotification={() => setOAuthFormNotification(undefined)}
+        />
+      </CatalogPageLayout>
+    );
+  }
+
+  if (isLoading && !data) {
+    return (
+      <CatalogPageLayout headingRef={pageHeadingRef}>
+        <div aria-busy="true">
+          <Loading />
+        </div>
+      </CatalogPageLayout>
+    );
+  }
+
+  if (error?.status === 404 && !data) {
+    return (
+      <CatalogPageLayout headingRef={pageHeadingRef}>
+        <div role="status" aria-live="polite" className="mt-6">
+          <EmptyStatePlaceholder messageId="mcpServer.catalog.disabled" />
+        </div>
+      </CatalogPageLayout>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <CatalogPageLayout headingRef={pageHeadingRef}>
+        <div className="mt-6">
+          <InlineNotification
+            type="error"
+            message={intl.formatMessage({ id: "mcpServer.catalog.error" })}
+          />
+          <Button
+            className="mt-3"
+            type="button"
+            variant="outline"
+            onClick={() => void refetch().catch(() => {})}
+          >
+            {intl.formatMessage({ id: "mcpServer.catalog.retry" })}
+          </Button>
+        </div>
+      </CatalogPageLayout>
+    );
+  }
+
+  return (
+    <CatalogPageLayout headingRef={pageHeadingRef}>
+      <CatalogToolbar
+        search={search}
+        installedOnly={filters.installedOnly}
+        category={filters.category}
+        provider={filters.provider}
+        authType={filters.authType}
+        selectedTags={filters.tags}
+        categories={categoryOptions}
+        providers={providerOptions}
+        authTypes={authTypeOptions}
+        availableTags={tagOptions}
+        activeFilterCount={activeFilterCount}
+        onSearchChange={setSearch}
+        onInstalledChange={(installedOnly) => updateQuery({ show_registered_only: installedOnly })}
+        onToggleOption={toggleFilterOption}
+        onClearSection={clearFilterSection}
+        onClearAll={clearAllFilters}
+      />
+
+      {registrationNotifications.length > 0 && (
+        <div className="mb-4">
+          <div className="space-y-2">
+            {registrationNotifications.map((notification) => (
+              <InlineNotification
+                key={notification.id}
+                ref={(element) => {
+                  if (element) registrationNotificationRefs.current.set(notification.id, element);
+                  else registrationNotificationRefs.current.delete(notification.id);
+                }}
+                type={notification.type}
+                message={notification.message}
+                action={
+                  notification.retryCatalogServer
+                    ? {
+                        label: intl.formatMessage({ id: "mcpServer.catalog.retry" }),
+                        onClick: () =>
+                          void handleDisconnectStatusRetry(notification.retryCatalogServer!),
+                      }
+                    : undefined
+                }
+                tabIndex={-1}
+                onDismiss={() => handleRegistrationNotificationDismiss(notification.id)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <CatalogResults
+        servers={servers}
+        emptyStateMessageId={emptyStateMessageId}
+        onView={handleView}
+        onAdd={handleAdd}
+        addingServerIds={addingServerIds}
+        onTest={(server) => void handleTest(server)}
+        onAuthorize={(server) => void handleAuthorize(server)}
+        onDisconnect={handleDisconnect}
+        testingServerIds={testingServerIds}
+        disconnectingServerIds={disconnectingServerIds}
+        canTest={canTest}
+        canDisconnect={canDisconnect}
+        oauthStatuses={oauthStatuses}
+        addErrors={addErrors}
+        onAddErrorRead={clearAddError}
+        onRetryOAuthStatus={(gatewayId) => void retryOAuthStatus(gatewayId)}
+      />
+
+      <p aria-live="polite" aria-atomic="true" className="sr-only">
+        {addErrorAnnouncement}
+      </p>
+
+      <CatalogServerDetailsDialog
+        server={selectedServer}
+        oauthStatus={
+          selectedServer?.gateway_id ? oauthStatuses[selectedServer.gateway_id] : undefined
+        }
+        onOpenChange={handleDetailsOpenChange}
+      />
+      <ConfirmDialog
+        open={disconnectServer !== null}
+        role="alertdialog"
+        onOpenChange={handleDisconnectDialogOpenChange}
+        title={intl.formatMessage({ id: "mcpServer.catalog.disconnectTitle" })}
+        description={
+          <div className="space-y-3">
+            <p>
+              {intl.formatMessage(
+                { id: "mcpServer.catalog.disconnectDescription" },
+                { name: disconnectServer?.name ?? "" },
+              )}
+            </p>
+            <p className="sr-only" aria-live="polite" aria-atomic="true">
+              {impactPreviewStatus === "loading"
+                ? intl.formatMessage({ id: "mcpServer.catalog.disconnectImpactLoading" })
+                : ""}
+            </p>
+            {impactPreviewStatus === "loading" && (
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: "mcpServer.catalog.disconnectImpactLoading" })}
+              </p>
+            )}
+            {impactPreviewStatus === "loaded" && impactPreview?.servers.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: "mcpServer.catalog.disconnectImpactNone" })}
+              </p>
+            )}
+            {impactPreviewStatus === "error" && (
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: "mcpServer.catalog.disconnectImpactError" })}
+              </p>
+            )}
+            {impactPreviewStatus === "loaded" &&
+              impactPreview &&
+              impactPreview.servers.length > 0 && (
+                <div>
+                  <p className="mb-1 text-sm font-medium">
+                    {intl.formatMessage({ id: "mcpServer.catalog.disconnectImpact" })}
+                  </p>
+                  <ul className="list-inside list-disc text-sm">
+                    {impactPreview.servers.map((server) => (
+                      <li key={server.id}>{server.name}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+          </div>
+        }
+        confirmLabel={intl.formatMessage({ id: "mcpServer.catalog.disconnect" })}
+        cancelLabel={intl.formatMessage({ id: "common.button.cancel" })}
+        variant="destructive"
+        onConfirm={confirmDisconnect}
+        isLoading={disconnectServer ? disconnectingServerIds.has(disconnectServer.id) : false}
+        loadingLabel={intl.formatMessage({ id: "mcpServer.catalog.disconnecting" })}
+        closeOnConfirm={false}
+        onCloseAutoFocus={handleDisconnectDialogCloseAutoFocus}
+      />
+      {apiKeyServer && (
+        <CatalogApiKeyDialog
+          server={apiKeyServer}
+          onOpenChange={(open) => {
+            if (!open) {
+              setApiKeyServer(null);
+              setApiKeyDialogNotification(undefined);
+            }
+          }}
+          onSubmit={handleApiKeySubmit}
+          isSubmitting={addingServerIds.has(apiKeyServer.id)}
+          notification={apiKeyDialogNotification}
+          onDismissNotification={() => setApiKeyDialogNotification(undefined)}
+        />
+      )}
+    </CatalogPageLayout>
+  );
+}

@@ -1,0 +1,122 @@
+import { createRef } from "react";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { InlineNotification } from "./inline-notification";
+
+describe("InlineNotification", () => {
+  it("forwards its root ref and supports programmatic focus", () => {
+    const ref = createRef<HTMLDivElement>();
+    render(<InlineNotification ref={ref} type="error" message="Failed" tabIndex={-1} />);
+
+    ref.current?.focus();
+
+    expect(ref.current).toBe(screen.getByRole("alert"));
+    expect(ref.current).toHaveFocus();
+  });
+
+  describe("success type", () => {
+    it("renders with role='status'", () => {
+      render(<InlineNotification type="success" message="All good" />);
+      expect(screen.getByRole("status")).toBeInTheDocument();
+    });
+
+    it("displays the message text", () => {
+      render(<InlineNotification type="success" message="Operation succeeded" />);
+      expect(screen.getByText("Operation succeeded")).toBeInTheDocument();
+    });
+
+    it("applies the success tone class to the message", () => {
+      render(<InlineNotification type="success" message="Done" />);
+      expect(screen.getByText("Done")).toHaveClass("text-success");
+    });
+  });
+
+  describe("error type", () => {
+    it("renders with role='alert'", () => {
+      render(<InlineNotification type="error" message="Something failed" />);
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+
+    it("displays the message text", () => {
+      render(<InlineNotification type="error" message="A server with this name already exists" />);
+      expect(screen.getByText("A server with this name already exists")).toBeInTheDocument();
+    });
+
+    it("applies the destructive tone class to the message", () => {
+      render(<InlineNotification type="error" message="Failed" />);
+      expect(screen.getByText("Failed")).toHaveClass("text-destructive");
+    });
+  });
+
+  describe("warning type", () => {
+    it("renders with role='status' and the warning tone", () => {
+      render(<InlineNotification type="warning" message="Careful" />);
+
+      expect(screen.getByRole("status")).toHaveTextContent("Careful");
+      expect(screen.getByText("Careful")).toHaveClass("text-warning");
+    });
+  });
+
+  describe("info type", () => {
+    it("renders with role='status' and neutral text", () => {
+      render(<InlineNotification type="info" message="Disconnect pending" />);
+
+      expect(screen.getByRole("status")).toHaveTextContent("Disconnect pending");
+      expect(screen.getByText("Disconnect pending")).toHaveClass("text-muted-foreground");
+    });
+  });
+
+  describe("dismiss button", () => {
+    it("renders dismiss button when onDismiss is provided", () => {
+      render(<InlineNotification type="success" message="Done" onDismiss={vi.fn()} />);
+      expect(screen.getByRole("button", { name: /dismiss notification/i })).toBeInTheDocument();
+    });
+
+    it("does not render dismiss button when onDismiss is not provided", () => {
+      render(<InlineNotification type="success" message="Done" />);
+      expect(screen.queryByRole("button", { name: /dismiss/i })).not.toBeInTheDocument();
+    });
+
+    it("calls onDismiss when dismiss button is clicked", async () => {
+      const onDismiss = vi.fn();
+      render(<InlineNotification type="error" message="Error" onDismiss={onDismiss} />);
+      await userEvent.click(screen.getByRole("button", { name: /dismiss notification/i }));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses default dismissLabel when none is provided", () => {
+      render(<InlineNotification type="success" message="Done" onDismiss={vi.fn()} />);
+      expect(screen.getByRole("button", { name: "Dismiss notification" })).toBeInTheDocument();
+    });
+
+    it("uses custom dismissLabel when provided", () => {
+      render(
+        <InlineNotification
+          type="error"
+          message="OAuth failed"
+          onDismiss={vi.fn()}
+          dismissLabel="Dismiss OAuth notification"
+        />,
+      );
+      expect(
+        screen.getByRole("button", { name: "Dismiss OAuth notification" }),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("renders and runs an optional action", async () => {
+    const onClick = vi.fn();
+    render(
+      <InlineNotification
+        type="error"
+        message="Disconnect is still running"
+        action={{ label: "Retry", onClick }}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+});

@@ -1,0 +1,80 @@
+# Dependencies
+node_modules/
+server/node_modules/
+
+# Build outputs
+dist/
+server/dist/
+# Entire SPA build dir — vite's outDir with emptyOutDir:true regenerates all
+# of it, including index.html; nothing under here should be tracked.
+server/public/
+
+# Test outputs
+test-results/
+playwright-report/
+coverage/
+.nyc_output/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+server/.env
+
+# Keep example env files
+!.env.example
+!server/.env.example
+
+# Self-signed TLS certs (npm run certs / docker-compose.tls.yml)
+certs/
+
+# Alternative package manager lock files
+pnpm-lock.yaml
+yarn.lock
+
+# Generated files
+src/generated/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+.temp/
+.bob/tmp/
+
+# TypeScript
+*.tsbuildinfo
+
+# Vite
+.vite/
+vite.config.ts.timestamp-*
+
+# Testing
+.vitest/

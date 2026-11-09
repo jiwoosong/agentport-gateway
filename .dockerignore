@@ -1,0 +1,11 @@
+.git
+.tools
+.cache
+.venv
+.env*
+data
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+dashboard/server/public
+dashboard/server/dist

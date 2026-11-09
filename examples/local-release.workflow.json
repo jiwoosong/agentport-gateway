@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "name": "Local extraction → approval → cloud",
+  "local_only": false,
+  "nodes": [
+    {"id": "extract", "type": "tool", "target": "LOCAL_EXTRACTOR_SERVICE_ID", "inputs": {"document": {"$ref": "input.document"}}, "position": {"x": 0, "y": 0}},
+    {"id": "release", "type": "approval", "release": true, "depends_on": ["extract"], "inputs": {"model": {"$ref": "input.model"}, "messages": [{"role": "user", "content": {"$ref": "nodes.extract.public_summary"}}]}, "position": {"x": 250, "y": 0}},
+    {"id": "research", "type": "model", "target": "CLOUD_MODEL_SERVICE_ID", "depends_on": ["release"], "inputs": {"$ref": "nodes.release.payload"}, "position": {"x": 500, "y": 0}}
+  ]
+}

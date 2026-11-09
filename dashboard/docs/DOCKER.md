@@ -1,0 +1,270 @@
+# Running in Docker
+
+This repo ships as **one image**: the BFF (`server/`, Fastify) serves the
+built UI (root, Vite/React SPA) as static files and proxies `/api/*`, so
+the whole client stack — UI + BFF — is a single container. Redis is a
+separate service, wired in via `docker-compose.yml`.
+
+The image builds on Red Hat UBI9 Node.js 22
+(`registry.access.redhat.com/ubi9/nodejs-22`, public/no-auth) rather than
+`node:alpine` — enterprise-supportable, glibc-based, non-root by default.
+
+`.env`/`.env.example` are shared with native (non-Docker) dev — see the
+root README's Getting Started section. `docker-compose.yml` and
+`server`'s native `npm run dev`/`start` both read the same repo-root
+`.env`.
+
+The upstream ContextForge/mcpgateway API is **not** part of this repo or
+this compose file — it's expected to already be running somewhere you
+point `CONTEXTFORGE_URL` at.
+
+## Published image
+
+Tagged releases are built and pushed to GHCR by
+`.github/workflows/docker-release.yml`. Note that the image tag drops the
+`v` the git tag carries — git `vX.Y.Z` publishes as image `X.Y.Z`:
+
+```bash
+docker pull ghcr.io/contextforge-org/contextforge-web-ui:X.Y.Z
+```
+
+Also available: the `X.Y` (minor) tag, and `latest` (stable releases
+only — prerelease/RC tags don't move it). Built for `linux/amd64` and
+`linux/arm64`. See the repo's **Releases** and **Packages** tabs for the
+full list of published tags, signatures, and SBOMs.
+
+To point `docker-compose.yml` at the published image instead of building
+locally, override the `app` service's `build:` key with `image:`:
+
+```yaml
+# docker-compose.override.yml
+services:
+  app:
+    image: ghcr.io/contextforge-org/contextforge-web-ui:X.Y.Z
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.override.yml up
+```
+
+For Helm/Kubernetes, point your chart's `image.repository` /
+`image.tag` (or equivalent values) at the same coordinates.
+
+## Quick start
+
+```bash
+cp .env.example .env
+# edit .env: CONTEXTFORGE_URL defaults to 0.0.0.0:8000, which is only
+# correct for native dev. If your gateway runs on the host, set:
+#   CONTEXTFORGE_URL=http://host.docker.internal:8000
+docker compose up --build
+```
+
+Visit `http://localhost:3000/` — redirects to `/app/login`. `GET /healthz`
+returns `{"ok":true}`.
+
+By default this boots with `COOKIE_SECURE=false` and sessions backed by
+this compose file's own `redis` service (`docker-compose.yml` defaults
+`REDIS_URL` to it; see below to override).
+
+## Environment variables
+
+Full reference: `.env.example` (each var has an inline comment).
+Summary, grouped the same way:
+
+| Group                | Vars                                                                                                                                                                                                                         | Notes                                                                                                                                                                                                                            |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Works out of the box | `COOKIE_SECURE=false`                                                                                                                                                                                                        | Required (or set `PUBLIC_ORIGIN`/`TRUST_PROXY`) for a zero-config boot — `server/src/config.ts` fails closed otherwise.                                                                                                          |
+| Must be set          | `CONTEXTFORGE_URL`                                                                                                                                                                                                           | No safe default reaches your gateway from inside the container. **No boot-time check catches a missing/wrong value** — it just fails every `/api/*` call at request time. Top thing to check if API calls all connection-refuse. |
+| Fine as-is for dev   | `PORT`, `HOST`, `CONTEXTFORGE_AUTH_HEADER_NAME`, `PASSWORD_RESET_REQUEST_TIMEOUT_MS`, `SESSION_TTL_SECONDS`, `REDIS_KEY_PREFIX`, `COOKIE_DOMAIN`, `TRUST_PROXY`, `PUBLIC_ORIGIN`, `SSE_SESSION_RECHECK_SECONDS`, `LOG_LEVEL` | Defaults match `server/src/config.ts`.                                                                                                                                                                                           |
+
+The image itself (`Dockerfile`) sets **none** of these — it ships
+respecting `config.ts`'s own defaults untouched. All configuration comes
+from the environment at run time.
+
+## Redis
+
+`docker-compose.yml` defaults `REDIS_URL` to its own `redis` service, so
+sessions are Redis-backed out of the box — no `.env` edit needed. Confirm
+it: hit the login route, then
+
+```bash
+docker compose exec redis redis-cli KEYS 'bff:*'
+```
+
+should show keys, and a session survives `docker compose restart app`.
+
+To use something else instead, set `REDIS_URL` in `.env` — e.g. a
+different Redis, or `REDIS_URL=memory://` for the in-process,
+lost-on-restart, single-instance-only fallback (`.env`'s value overrides
+the compose default). If you see the `memory-redis` warning in
+`docker compose logs app` and didn't ask for it, check `.env` isn't
+setting `REDIS_URL=memory://`.
+
+## SSO (Keycloak)
+
+`SSO_ENABLED=false` by default — the container boots the same either way,
+nothing extra to configure for a plain password-login deployment. Turning
+it on needs a Keycloak client registered for this BFF (separate from the
+gateway's own) and a one-time gateway-side admin-API step with no env var
+equivalent — see [`sso-keycloak-setup.md`](./sso-keycloak-setup.md).
+
+## Local TLS (self-signed certs)
+
+`npm run certs` generates a self-signed cert/key pair for local HTTPS
+testing, written to `./certs/cert.pem` and `./certs/key.pem` (gitignored,
+never committed). It's idempotent — safe to re-run, and it refuses to
+overwrite a cert you've placed there yourself.
+
+```bash
+npm run certs
+```
+
+The cert covers `localhost`, `127.0.0.1`, and the internal service names
+this stack's TLS setup uses (`app`, `keycloak`, `gateway`, `nginx`), and is
+valid for 365 days. `docker-compose.tls.yml` adds a `cert_init` one-shot
+service that runs the same script inside the TLS compose stack, so certs
+are generated automatically on first boot — no manual step needed:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tls.yml run --rm cert_init
+```
+
+### Running the stack over HTTPS
+
+`npm run compose:tls` brings the stack up at `https://localhost:8443`
+behind a local `nginx_tls` reverse proxy (`nginx:alpine`, config in
+`infra/nginx/tls.conf.template`), which terminates TLS with the cert from
+`cert_init` above and proxies to the app over plain HTTP on the docker
+network. No `.env` edits needed — the override sets `COOKIE_SECURE=true`,
+`TRUST_PROXY=true` and `PUBLIC_ORIGIN=https://localhost:8443` on the `app`
+service itself.
+
+```bash
+npm run compose:tls
+# https://localhost:8443 — accept the self-signed cert warning once
+npm run compose:tls:down
+```
+
+With the stack from `npm run compose:tls` still up (don't run
+`compose:tls:down` first), verify it's actually working with
+`npm run tls:smoke` — checks the health endpoint, TLS 1.1/1.2/1.3
+acceptance, the no-HSTS and force-redirect behavior, and (with
+`SMOKE_EMAIL`/`SMOKE_PASSWORD` set, pointing at a real login) that
+`bff_sid` and `bff_csrf` both come back `Secure`. Exits non-zero and
+names whichever checks failed:
+
+```bash
+npm run tls:smoke
+# or, to also check Secure cookies via a real login:
+SMOKE_EMAIL=you@example.com SMOKE_PASSWORD=yourpassword npm run tls:smoke # pragma: allowlist secret
+```
+
+- Plain HTTP still works on `:8080` (proxied, not redirected, by default).
+  Set `NGINX_FORCE_HTTPS=true` before `compose:tls` to make `:8080` return
+  a 301 to `:8443` instead.
+- Only TLS 1.2 and 1.3 are accepted; no `Strict-Transport-Security` header
+  is sent (it would pin `localhost` to HTTPS in your browser).
+- SSE (streamed tool responses) is proxied unbuffered with a long read
+  timeout, so long-lived streams survive past nginx's normal timeouts.
+- The app's `:3000` port stays published alongside `:8443` — see
+  [#7031](https://github.com/IBM/mcp-context-forge/issues/7031)'s "Out of
+  scope" for why that's harmless rather than a leftover to clean up.
+- The app also trusts `cert_init`'s cert for its own outbound HTTPS calls
+  (`NODE_EXTRA_CA_CERTS`, mounted read-only — just `cert.pem`, never
+  `key.pem`) — this is what lets it reach Keycloak/the gateway over
+  `https://nginx` once those are TLS-terminated too. **Never set
+  `NODE_TLS_REJECT_UNAUTHORIZED=0`** as a shortcut instead: it disables
+  TLS verification for _every_ outbound call, not just this one. Boot
+  refuses that combined with `COOKIE_SECURE=true` (the default,
+  production-like setting) — but that guard doesn't trigger under
+  `COOKIE_SECURE=false`, and a missing or invalid `NODE_EXTRA_CA_CERTS`
+  path isn't validated at boot either; either way the only way to find
+  out is a self-signed-cert error on the first outbound call.
+
+This covers certs, TLS termination, and the BFF's own outbound trust
+([#7031](https://github.com/IBM/mcp-context-forge/issues/7031), stories
+1–3). Follow-up PRs add Keycloak served over HTTPS and TLS coverage in
+e2e/CI.
+
+## Production checklist
+
+Before this leaves a laptop:
+
+- `COOKIE_SECURE=true`
+- `REDIS_URL=redis://...` pointing at a real, persistent Redis (not `memory://`)
+- `PUBLIC_ORIGIN=https://your-domain.example.com`, or `TRUST_PROXY=true` if
+  directly TLS-terminated with no reverse proxy in front
+- `CONTEXTFORGE_URL` pointing at your real gateway
+- Don't set `NODE_TLS_REJECT_UNAUTHORIZED=0`; use `NODE_EXTRA_CA_CERTS`
+  for a private CA instead
+
+`server/src/config.ts` fails closed at boot, rather than serving
+traffic insecurely, on: `REDIS_URL=memory://` combined with
+`COOKIE_SECURE=true`; `COOKIE_SECURE=true` with neither `PUBLIC_ORIGIN`
+nor `TRUST_PROXY=true` set; and `NODE_TLS_REJECT_UNAUTHORIZED=0`
+combined with `COOKIE_SECURE=true`. `CONTEXTFORGE_URL` has no boot-time
+check at all — a wrong value just fails every `/api/*` call at request
+time. That fail-closed behavior is intentional; don't work around it by
+setting `NODE_ENV=production` or similar in the image itself.
+
+## Joining an existing stack / network
+
+The provided `docker-compose.yml` is a standalone reference stack (app +
+redis). If you already have your own Redis, network, or reverse proxy:
+
+**Option A — run the image directly**, pointing at your own infra:
+
+```bash
+docker build -t contextforge-web-ui .
+docker run -p 3000:3000 \
+  --network your-existing-network \
+  -e COOKIE_SECURE=true \
+  -e REDIS_URL=redis://your-redis-host:6379/0 \
+  -e CONTEXTFORGE_URL=http://your-gateway:4444 \
+  -e PUBLIC_ORIGIN=https://your-domain.example.com \
+  contextforge-web-ui
+```
+
+**Option B — override compose**, attaching to an external network instead
+of the bundled `redis` service:
+
+```yaml
+# docker-compose.override.yml
+services:
+  app:
+    networks: [external_net]
+    environment:
+      REDIS_URL: redis://your-existing-redis:6379/0
+
+networks:
+  external_net:
+    external: true
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.override.yml up --build
+```
+
+## Troubleshooting
+
+- **Every `/api/*` request (including login) fails with `ECONNREFUSED`**:
+  `CONTEXTFORGE_URL` is unreachable from inside the container — most often
+  because it's still set to `.env.example`'s native-dev default
+  (`0.0.0.0:8000`/`127.0.0.1:...`), which inside a container points at the
+  container's own loopback, not the host. If your gateway runs on the
+  host, set `CONTEXTFORGE_URL=http://host.docker.internal:8000` instead
+  (`docker-compose.yml` maps that hostname to the host on both Docker
+  Desktop and Linux). There's no boot-time check for this — the app
+  starts fine either way.
+- **Container crash-loops on startup**: check `docker compose logs app` —
+  `config.ts` throws a specific error for each fail-closed case
+  (`memory://` Redis with `COOKIE_SECURE=true`, or `COOKIE_SECURE=true`
+  with neither `PUBLIC_ORIGIN` nor `TRUST_PROXY` set). The message tells
+  you exactly which var to set.
+- **Multi-arch builds** (e.g. building on Apple Silicon for an amd64
+  target): `docker buildx build --platform linux/amd64,linux/arm64 -t contextforge-web-ui .`
+  — the UI stage's native dependency (`lightningcss`, via
+  `@tailwindcss/vite`) ships prebuilt glibc binaries for both architectures
+  (the base image is glibc-based UBI, not musl-based Alpine), so no
+  Dockerfile changes should be needed.

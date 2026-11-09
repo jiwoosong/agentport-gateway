@@ -1,0 +1,404 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+import { TOOL_CANCEL_REVEAL_DELAY_MS } from "@/config/toolInvocation";
+import { renderWithProviders as render } from "@/test/test-utils";
+import type { ToolInvokeState } from "@/hooks/useToolInvoke";
+import type { Tool } from "@/types/tool";
+import {
+  getToolLiveInvokeToggleVisibility,
+  resolveToolLiveInvokeAvailability,
+  ToolLiveInvokeGate,
+} from "./ToolLiveInvokeGate";
+
+const mockHasPermission = vi.fn((_perm: string) => true);
+let mockPermissionsLoading = false;
+
+vi.mock("@/auth/useAuth", () => ({
+  useAuth: () => ({
+    hasPermission: mockHasPermission,
+    permissionsLoading: mockPermissionsLoading,
+  }),
+}));
+
+function makeTool(overrides: Partial<Tool> = {}): Tool {
+  return {
+    id: "tool-search",
+    name: "search_issues",
+    originalName: "search_issues",
+    description: "Search repository issues",
+    originalDescription: "Search repository issues",
+    title: "Search issues",
+    displayName: "Search issues",
+    gatewayId: null,
+    gatewaySlug: "local",
+    customName: "",
+    customNameSlug: "search_issues",
+    enabled: true,
+    reachable: true,
+    deprecated: false,
+    executionCount: 0,
+    tags: [],
+    integrationType: "MCP",
+    requestType: "http",
+    url: "https://example.com/mcp",
+    headers: {},
+    annotations: {},
+    jsonpathFilter: null,
+    auth: null,
+    version: 1,
+    visibility: "team",
+    createdAt: "2024-01-01T00:00:00",
+    updatedAt: "2024-01-02T00:00:00",
+    inputSchema: { type: "object", properties: {} },
+    outputSchema: { type: "object" },
+    ...overrides,
+  };
+}
+
+function makeInvoke(
+  overrides: Partial<Pick<ToolInvokeState, "run" | "stopWaiting" | "isLoading" | "hasRun">> = {},
+): Pick<ToolInvokeState, "run" | "stopWaiting" | "isLoading" | "hasRun"> {
+  return {
+    run: vi.fn(),
+    stopWaiting: vi.fn(),
+    isLoading: false,
+    hasRun: false,
+    ...overrides,
+  };
+}
+
+describe("resolveToolLiveInvokeAvailability", () => {
+  it("checks permissions before annotations", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: false,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: { annotations: { readOnlyHint: true }, gatewayId: null },
+      }),
+    ).toEqual({ state: "missingPermission", permission: "tools.execute" });
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: false,
+        permissionsLoading: false,
+        tool: { annotations: { readOnlyHint: true }, gatewayId: null },
+      }),
+    ).toEqual({ state: "missingPermission", permission: "servers.use" });
+  });
+
+  it("allows read-only tools including federated tools", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: { annotations: { readOnlyHint: true }, gatewayId: "gw-1" },
+      }),
+    ).toEqual({ state: "available" });
+  });
+
+  it("requires confirmation for local destructive tools", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: { annotations: { destructiveHint: true }, gatewayId: null },
+      }),
+    ).toEqual({ state: "requiresConfirmation" });
+  });
+
+  it("blocks live invocation when gateway identity is malformed", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        invalidGatewayId: true,
+        tool: { annotations: { destructiveHint: true }, gatewayId: null },
+      }),
+    ).toEqual({ state: "unavailableInvalidGateway" });
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: { annotations: { readOnlyHint: true }, gatewayId: "" },
+      }),
+    ).toEqual({ state: "unavailableInvalidGateway" });
+  });
+
+  it("treats destructiveHint as higher priority than readOnlyHint", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: {
+          annotations: { readOnlyHint: true, destructiveHint: true },
+          gatewayId: null,
+        },
+      }),
+    ).toEqual({ state: "requiresConfirmation" });
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: {
+          annotations: { readOnlyHint: true, destructiveHint: true },
+          gatewayId: "gw-1",
+        },
+      }),
+    ).toEqual({ state: "unavailableFederated" });
+  });
+
+  it("does not offer federated or untagged tools pending approval policy", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: { annotations: {}, gatewayId: "gw-1" },
+      }),
+    ).toEqual({ state: "unavailableFederated" });
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: true,
+        canUseServers: true,
+        permissionsLoading: false,
+        tool: { annotations: {}, gatewayId: null },
+      }),
+    ).toEqual({ state: "unavailableUntagged" });
+  });
+
+  it("reports a permissions load failure ahead of the individual permission checks", () => {
+    expect(
+      resolveToolLiveInvokeAvailability({
+        canExecute: false,
+        canUseServers: false,
+        permissionsLoading: false,
+        permissionsError: true,
+        tool: { annotations: { readOnlyHint: true }, gatewayId: null },
+      }),
+    ).toEqual({ state: "permissionsError" });
+  });
+});
+
+describe("getToolLiveInvokeToggleVisibility", () => {
+  it("hides the toggle only when the caller lacks a required permission", () => {
+    expect(
+      getToolLiveInvokeToggleVisibility({
+        state: "missingPermission",
+        permission: "tools.execute",
+      }),
+    ).toBe("hidden");
+    expect(
+      getToolLiveInvokeToggleVisibility({ state: "missingPermission", permission: "servers.use" }),
+    ).toBe("hidden");
+  });
+
+  it("shows the toggle enabled once invocation is safe", () => {
+    expect(getToolLiveInvokeToggleVisibility({ state: "available" })).toBe("enabled");
+    expect(getToolLiveInvokeToggleVisibility({ state: "requiresConfirmation" })).toBe("enabled");
+  });
+
+  it("shows the toggle disabled with a reason for every other unavailable state", () => {
+    expect(getToolLiveInvokeToggleVisibility({ state: "checkingAccess" })).toBe("disabled");
+    expect(getToolLiveInvokeToggleVisibility({ state: "permissionsError" })).toBe("disabled");
+    expect(getToolLiveInvokeToggleVisibility({ state: "unavailableInvalidGateway" })).toBe(
+      "disabled",
+    );
+    expect(getToolLiveInvokeToggleVisibility({ state: "unavailableFederated" })).toBe("disabled");
+    expect(getToolLiveInvokeToggleVisibility({ state: "unavailableUntagged" })).toBe("disabled");
+  });
+});
+
+describe("ToolLiveInvokeGate", () => {
+  beforeEach(() => {
+    mockHasPermission.mockReset();
+    mockHasPermission.mockReturnValue(true);
+    mockPermissionsLoading = false;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs immediately for read-only tools", async () => {
+    const user = userEvent.setup();
+    const invoke = makeInvoke();
+    render(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={invoke}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Live invoke" }));
+
+    expect(invoke.run).toHaveBeenCalledTimes(1);
+    expect(mockHasPermission).toHaveBeenCalledWith("tools.execute");
+    expect(mockHasPermission).toHaveBeenCalledWith("servers.use");
+  });
+
+  it("uses the tool action presentation when requested", async () => {
+    const user = userEvent.setup();
+    const invoke = makeInvoke();
+    const { rerender } = render(
+      <ToolLiveInvokeGate
+        presentation="tool"
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={invoke}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Invoke tool" }));
+    expect(invoke.run).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ToolLiveInvokeGate
+        presentation="tool"
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={makeInvoke({ hasRun: true })}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Re-invoke tool" })).toBeInTheDocument();
+  });
+
+  it("does not run or confirm when the pre-run check fails", async () => {
+    const user = userEvent.setup();
+    const invoke = makeInvoke();
+    const onBeforeRun = vi.fn(() => false);
+    const { rerender } = render(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={invoke}
+        onBeforeRun={onBeforeRun}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Live invoke" }));
+    expect(onBeforeRun).toHaveBeenCalledOnce();
+    expect(invoke.run).not.toHaveBeenCalled();
+
+    rerender(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { destructiveHint: true } })}
+        invoke={invoke}
+        onBeforeRun={onBeforeRun}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Live invoke" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(invoke.run).not.toHaveBeenCalled();
+  });
+
+  it("confirms local destructive tools before running", async () => {
+    const user = userEvent.setup();
+    const invoke = makeInvoke();
+    render(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { destructiveHint: true }, name: "delete_issue" })}
+        invoke={invoke}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Live invoke" }));
+    const dialog = screen.getByRole("alertdialog", { name: "Invoke destructive tool" });
+    expect(dialog).toHaveTextContent('Invoke "delete_issue" against the live gateway?');
+
+    await user.click(screen.getByRole("button", { name: "Invoke tool" }));
+
+    expect(invoke.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows RBAC and loading gates", () => {
+    mockHasPermission.mockImplementation((permission) => permission !== "tools.execute");
+    const { rerender } = render(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={makeInvoke()}
+      />,
+    );
+
+    expect(screen.getByText("Live invoke requires tools.execute.")).toBeInTheDocument();
+
+    mockHasPermission.mockImplementation((permission) => permission === "tools.execute");
+    rerender(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={makeInvoke()}
+      />,
+    );
+    expect(screen.getByText("Live invoke requires servers.use.")).toBeInTheDocument();
+
+    mockHasPermission.mockReturnValue(true);
+    mockPermissionsLoading = true;
+    rerender(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={makeInvoke()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Checking access" })).toBeDisabled();
+    expect(screen.getByText("Checking your tool permissions.")).toBeInTheDocument();
+
+    mockPermissionsLoading = false;
+  });
+
+  it("reveals cancellation only after an invoke has been running for a few seconds", () => {
+    vi.useFakeTimers();
+    const invoke = makeInvoke();
+    const { rerender } = render(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={invoke}
+      />,
+    );
+
+    rerender(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={{ ...invoke, isLoading: true }}
+      />,
+    );
+    const cancelAnnouncement = screen.getByRole("status");
+    expect(cancelAnnouncement).toHaveAttribute("aria-live", "polite");
+    expect(cancelAnnouncement).toHaveAttribute("aria-atomic", "true");
+    expect(cancelAnnouncement).toBeEmptyDOMElement();
+    expect(screen.getByRole("button", { name: "Invoking..." })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Cancel request" })).not.toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(TOOL_CANCEL_REVEAL_DELAY_MS - 1);
+    });
+    expect(screen.queryByRole("button", { name: "Cancel request" })).not.toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(cancelAnnouncement).toHaveTextContent("Cancel request");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel request" }));
+    expect(invoke.stopWaiting).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={makeInvoke({ isLoading: false, hasRun: true })}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Cancel request" })).not.toBeInTheDocument();
+
+    rerender(
+      <ToolLiveInvokeGate
+        tool={makeTool({ annotations: { readOnlyHint: true } })}
+        invoke={makeInvoke({ isLoading: true, hasRun: true })}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Cancel request" })).not.toBeInTheDocument();
+  });
+});

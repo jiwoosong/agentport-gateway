@@ -1,0 +1,66 @@
+import { defineConfig, devices } from "@playwright/test";
+
+// Set by `npm run e2e:docker` — the suite runs against the real dockerized
+// backend (with PLAYWRIGHT_SKIP_WEBSERVER + its own PLAYWRIGHT_BASE_URL)
+// instead of page.route() stubs. See e2e/README.md.
+const IS_REAL_API = process.env.E2E_REAL_API === "true";
+
+// Override for a pre-running server (typically together with PLAYWRIGHT_SKIP_WEBSERVER).
+const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:5173";
+const IS_CI = !!process.env.CI;
+const REUSE_EXISTING_SERVER = process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === "true";
+
+export default defineConfig({
+  testDir: "./e2e",
+  testMatch: /.*\.spec\.ts$/,
+  timeout: 30_000,
+  expect: { timeout: 10_000 },
+
+  fullyParallel: true,
+  forbidOnly: IS_CI,
+  retries: IS_CI ? 2 : 0,
+  // Real mode: the sqlite-backed test gateway chokes on too many concurrent real logins.
+  workers: IS_REAL_API ? 2 : IS_CI ? 2 : undefined,
+
+  reporter: IS_CI
+    ? [["github"], ["html", { open: "never", outputFolder: "playwright-report" }], ["list"]]
+    : [["list"], ["html", { open: "on-failure", outputFolder: "playwright-report" }]],
+
+  outputDir: "./test-results",
+
+  use: {
+    baseURL: BASE_URL,
+    // e2e:docker:tls points BASE_URL at the self-signed https://localhost:8443
+    // stack. Covers both the browser and Playwright's own `request` context;
+    // stays off for every existing http:// mode.
+    ignoreHTTPSErrors: BASE_URL.startsWith("https"),
+    trace: "on-first-retry",
+    screenshot: "only-on-failure",
+    video: "retain-on-failure",
+    actionTimeout: 10_000,
+    navigationTimeout: 15_000,
+    extraHTTPHeaders: {
+      // Identify Playwright traffic in dev-server logs.
+      "X-Playwright": "1",
+    },
+  },
+
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
+  ],
+
+  // e2e:docker sets PLAYWRIGHT_SKIP_WEBSERVER — it points at the already-running docker stack instead.
+  webServer: process.env.PLAYWRIGHT_SKIP_WEBSERVER
+    ? undefined
+    : {
+        command: "npm run dev:e2e",
+        url: BASE_URL,
+        reuseExistingServer: REUSE_EXISTING_SERVER,
+        timeout: 120_000,
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+});

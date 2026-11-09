@@ -1,0 +1,484 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { I18nProvider } from "@/i18n";
+import type { TeamMember } from "@/types/team";
+import { useTeamMembersForm } from "./useTeamMembersForm";
+
+vi.mock("@/api/teams", () => ({
+  listTeamMembers: vi.fn(),
+  addTeamMember: vi.fn(() => Promise.resolve()),
+  inviteTeamMember: vi.fn((_teamId: string, data: { email: string; role: string }) =>
+    Promise.resolve({
+      id: "inv-1",
+      team_id: "team-1",
+      team_name: "Team",
+      email: data.email,
+      role: data.role,
+      invited_by: "owner@example.com",
+      invited_at: "2024-01-01T00:00:00Z",
+      expires_at: "2024-01-08T00:00:00Z",
+      token: "token-1",
+      is_active: true,
+      is_expired: false,
+      invitation_url: "https://example.com/invite/token-1",
+      email_delivery_status: "sent",
+    }),
+  ),
+  updateTeamMember: vi.fn(() => Promise.resolve()),
+  removeTeamMember: vi.fn(() => Promise.resolve()),
+}));
+
+vi.mock("sonner", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
+}));
+
+vi.mock("@/lib/clipboard", () => ({
+  copyToClipboard: vi.fn(() => Promise.resolve(true)),
+}));
+
+vi.mock("@/api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/client")>();
+  return {
+    ...actual,
+    api: { get: vi.fn(() => Promise.resolve({ users: [] })) },
+  };
+});
+
+import {
+  listTeamMembers,
+  addTeamMember,
+  inviteTeamMember,
+  updateTeamMember,
+  removeTeamMember,
+} from "@/api/teams";
+import { USER_NOT_FOUND_DETAIL } from "@/utils/errors";
+import { api, ApiError } from "@/api/client";
+import { toast } from "sonner";
+import { copyToClipboard } from "@/lib/clipboard";
+
+const TEAM_ID = "team-1";
+
+function wrapper({ children }: { children: ReactNode }) {
+  return createElement(I18nProvider, null, children);
+}
+
+function makeMember(overrides: Partial<TeamMember> = {}): TeamMember {
+  return {
+    user_email: "existing@example.com",
+    role: "member",
+    joined_at: "2024-01-01T00:00:00Z",
+    invited_by: "owner@example.com",
+    ...overrides,
+  };
+}
+
+function renderForm(onSuccess = vi.fn(), onClose = vi.fn()) {
+  return {
+    onSuccess,
+    onClose,
+    ...renderHook(() => useTeamMembersForm({ open: true, teamId: TEAM_ID, onSuccess, onClose }), {
+      wrapper,
+    }),
+  };
+}
+
+describe("useTeamMembersForm", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("loads members and hides those without an inviter", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([
+      makeMember({ user_email: "a@example.com", invited_by: "owner@example.com" }),
+      makeMember({ user_email: "b@example.com", invited_by: "" }),
+      makeMember({ user_email: "c@example.com", invited_by: null }),
+    ]);
+
+    const { result } = renderForm();
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.members.map((m) => m.email)).toEqual(["a@example.com"]);
+  });
+
+  it("builds member options from the user directory", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(api.get).mockResolvedValueOnce({
+      users: [
+        { email: "jane@example.com", full_name: "Jane Doe" },
+        { email: "no-name@example.com", full_name: "" },
+      ],
+    });
+
+    const { result } = renderForm();
+
+    await waitFor(() => expect(result.current.memberOptions).toHaveLength(2));
+    expect(result.current.memberOptions).toEqual([
+      {
+        value: "jane@example.com",
+        label: "Jane Doe (jane@example.com)",
+        searchText: "Jane Doe jane@example.com",
+      },
+      {
+        value: "no-name@example.com",
+        label: "no-name@example.com",
+        searchText: "no-name@example.com",
+      },
+    ]);
+  });
+
+  it("fetches the full user directory with limit=0", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    renderForm();
+
+    await waitFor(() =>
+      expect(api.get).toHaveBeenCalledWith(
+        "/auth/email/admin/users?limit=0&include_pagination=true",
+      ),
+    );
+  });
+
+  it("seeds one empty editable row when there are no members", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    const { result } = renderForm();
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.members).toHaveLength(1);
+    expect(result.current.members[0]).toMatchObject({
+      email: "",
+      role: "member",
+      isExisting: false,
+    });
+  });
+
+  it("adds new members with an email on save", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    const { result, onSuccess, onClose } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.addRow());
+    const newId = result.current.members[0].id;
+    act(() => result.current.changeEmail(newId, "new@example.com"));
+    act(() => result.current.changeRole(newId, "owner"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(addTeamMember).toHaveBeenCalledWith(TEAM_ID, {
+      email: "new@example.com",
+      role: "owner",
+    });
+    expect(onSuccess).toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("invites a new row whose email has no account instead of failing", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(addTeamMember).mockRejectedValueOnce(
+      new ApiError(404, { detail: USER_NOT_FOUND_DETAIL }, "HTTP 404"),
+    );
+    const { result, onSuccess } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.changeEmail(result.current.members[0].id, "nobody@example.com"));
+    act(() => result.current.changeRole(result.current.members[0].id, "owner"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(addTeamMember).toHaveBeenCalledWith(TEAM_ID, {
+      email: "nobody@example.com",
+      role: "owner",
+    });
+    expect(inviteTeamMember).toHaveBeenCalledWith(TEAM_ID, {
+      email: "nobody@example.com",
+      role: "owner",
+    });
+    expect(onSuccess).toHaveBeenCalled();
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("invitation"),
+      expect.objectContaining({ description: expect.stringContaining("nobody@example.com") }),
+    );
+  });
+
+  it("reports a directly added member by address, not just a change count", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.changeEmail(result.current.members[0].id, "new@example.com"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(toast.success).toHaveBeenCalledWith(
+      expect.stringContaining("member"),
+      expect.objectContaining({ description: expect.stringContaining("new@example.com") }),
+    );
+  });
+
+  it("warns with a copyable link when an invitation is created but not delivered", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(addTeamMember).mockRejectedValueOnce(
+      new ApiError(404, { detail: USER_NOT_FOUND_DETAIL }, "HTTP 404"),
+    );
+    vi.mocked(inviteTeamMember).mockResolvedValueOnce({
+      id: "inv-2",
+      team_id: TEAM_ID,
+      team_name: "Team",
+      email: "nobody@example.com",
+      role: "member",
+      invited_by: "owner@example.com",
+      invited_at: "2024-01-01T00:00:00Z",
+      expires_at: "2024-01-08T00:00:00Z",
+      token: "token-2",
+      is_active: true,
+      is_expired: false,
+      invitation_url: "https://example.com/invite/token-2",
+      email_delivery_status: "disabled",
+      warning: "Email delivery is disabled for this deployment.",
+    });
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.changeEmail(result.current.members[0].id, "nobody@example.com"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    // Delivery wasn't confirmed, so this must not be reported via the
+    // "invitation sent" success toast.
+    expect(toast.success).not.toHaveBeenCalledWith(
+      expect.stringContaining("invitation"),
+      expect.anything(),
+    );
+    // Nothing was delivered, so no success toast (including the generic
+    // change-count one) should fire.
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.warning).toHaveBeenCalledWith(
+      expect.stringContaining("nobody@example.com"),
+      expect.objectContaining({
+        description: "Email delivery is disabled for this deployment.",
+        action: expect.objectContaining({ onClick: expect.any(Function) }),
+      }),
+    );
+
+    const [, options] = vi.mocked(toast.warning).mock.calls[0];
+    const action = options?.action as unknown as { onClick: () => void };
+    action.onClick();
+    expect(copyToClipboard).toHaveBeenCalledWith("https://example.com/invite/token-2");
+  });
+
+  it("invites a new row at the default member role (not just owner)", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(addTeamMember).mockRejectedValueOnce(
+      new ApiError(404, { detail: USER_NOT_FOUND_DETAIL }, "HTTP 404"),
+    );
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // Row 0 starts at the default role ("member"); only the email is changed.
+    act(() => result.current.changeEmail(result.current.members[0].id, "nobody@example.com"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(inviteTeamMember).toHaveBeenCalledWith(TEAM_ID, {
+      email: "nobody@example.com",
+      role: "member",
+    });
+  });
+
+  it("does not fall back to inviting on a 404 unrelated to an unknown user", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(addTeamMember).mockRejectedValueOnce(
+      new ApiError(404, { detail: "Team not found" }, "HTTP 404"),
+    );
+    const { result, onClose } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.changeEmail(result.current.members[0].id, "someone@example.com"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(inviteTeamMember).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      "Failed to save team members",
+      expect.objectContaining({ description: expect.any(String) }),
+    );
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("skips new rows with a blank email", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.addRow());
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(addTeamMember).not.toHaveBeenCalled();
+  });
+
+  it("updates the role of an existing member when it changes", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([
+      makeMember({ user_email: "a@example.com", role: "member" }),
+    ]);
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.changeRole(result.current.members[0].id, "owner"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(updateTeamMember).toHaveBeenCalledWith(TEAM_ID, "a@example.com", {
+      role: "owner",
+    });
+    expect(addTeamMember).not.toHaveBeenCalled();
+    expect(removeTeamMember).not.toHaveBeenCalled();
+  });
+
+  it("does not update an existing member whose role is unchanged", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([
+      makeMember({ user_email: "a@example.com", role: "member" }),
+    ]);
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(updateTeamMember).not.toHaveBeenCalled();
+  });
+
+  it("removes existing members that were deleted from the rows", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([makeMember({ user_email: "a@example.com" })]);
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.removeRow(result.current.members[0].id));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(removeTeamMember).toHaveBeenCalledWith(TEAM_ID, "a@example.com");
+  });
+
+  it("uses the original email for existing members (email is immutable)", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([
+      makeMember({ user_email: "a@example.com", role: "member" }),
+    ]);
+    const { result } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // Even if the row email were somehow changed, an existing member is only
+    // ever role-updated by original email, never re-added under a new email.
+    act(() => result.current.changeRole(result.current.members[0].id, "owner"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(updateTeamMember).toHaveBeenCalledWith(TEAM_ID, "a@example.com", {
+      role: "owner",
+    });
+    expect(addTeamMember).not.toHaveBeenCalled();
+  });
+
+  it("does not load members while the dialog is closed", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+
+    const { result } = renderHook(
+      () =>
+        useTeamMembersForm({
+          open: false,
+          teamId: TEAM_ID,
+          onSuccess: vi.fn(),
+          onClose: vi.fn(),
+        }),
+      { wrapper },
+    );
+
+    // Wait for any potential state updates to settle
+    await waitFor(() => {
+      expect(result.current).toBeDefined();
+    });
+
+    expect(listTeamMembers).not.toHaveBeenCalled();
+  });
+
+  it("ignores the user directory response after unmount", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    let resolveUsers: (value: { users: unknown[] }) => void = () => {};
+    vi.mocked(api.get).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveUsers = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderForm();
+    unmount();
+    // Resolve the in-flight fetch only after the effect has been cleaned up.
+    resolveUsers({ users: [{ email: "late@example.com", full_name: "Late" }] });
+    await Promise.resolve();
+
+    expect(result.current.memberOptions).toEqual([]);
+  });
+
+  it("logs an error when the user directory fetch fails", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(api.get).mockRejectedValueOnce(new Error("no users"));
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { result } = renderForm();
+
+    await waitFor(() => expect(consoleSpy).toHaveBeenCalled());
+    expect(result.current.memberOptions).toEqual([]);
+    consoleSpy.mockRestore();
+  });
+
+  it("shows an error toast when loading members fails", async () => {
+    vi.mocked(listTeamMembers).mockRejectedValue(new Error("forbidden"));
+
+    const { result } = renderForm();
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(toast.error).toHaveBeenCalledWith(
+      "Failed to load team members",
+      expect.objectContaining({ description: expect.any(String) }),
+    );
+  });
+
+  it("shows an error toast and stays open when saving fails", async () => {
+    vi.mocked(listTeamMembers).mockResolvedValue([]);
+    vi.mocked(addTeamMember).mockRejectedValueOnce(new Error("boom"));
+    const { result, onClose } = renderForm();
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    act(() => result.current.changeEmail(result.current.members[0].id, "new@example.com"));
+
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(toast.error).toHaveBeenCalledWith(
+      "Failed to save team members",
+      expect.objectContaining({ description: expect.any(String) }),
+    );
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});

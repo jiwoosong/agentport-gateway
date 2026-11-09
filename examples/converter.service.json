@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "Text to CSV",
+  "kind": "tool",
+  "transport": "http",
+  "endpoint": "http://converter:8080/convert",
+  "health_url": "http://converter:8080/health",
+  "lifecycle": "manual",
+  "location": "local",
+  "egress_policy": "isolated",
+  "idempotent": true,
+  "input_schema": {
+    "type": "object",
+    "properties": {"text": {"type": "string", "title": "Text or file contents", "maxLength": 500000}},
+    "required": ["text"],
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {"filename": {"type": "string"}, "text": {"type": "string"}, "lines": {"type": "integer"}},
+    "required": ["filename", "text", "lines"]
+  }
+}

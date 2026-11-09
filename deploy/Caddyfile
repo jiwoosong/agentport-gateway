@@ -1,0 +1,10 @@
+{$AGENTPORT_HOST:localhost} {
+  tls internal
+  @mcp path /orchestration/v1/mcp*
+  handle @mcp {
+    reverse_proxy gateway:4444
+  }
+  handle {
+    reverse_proxy dashboard:3000
+  }
+}

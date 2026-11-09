@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "Codex session → Claude review",
+  "local_only": false,
+  "nodes": [{
+    "id": "implementation", "type": "review", "target": "CODEX_AGENT_ID", "reviewer": "CLAUDE_AGENT_ID",
+    "session_id": null, "max_rounds": 3, "release": true,
+    "inputs": {"instruction": {"$ref": "input.instruction"}, "workspace_files": {"$ref": "input.files"}, "export_paths": {"$ref": "input.export_paths"}},
+    "position": {"x": 120, "y": 120}
+  }]
+}

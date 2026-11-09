@@ -1,0 +1,357 @@
+import { useIntl } from "react-intl";
+import { Field } from "@/components/ui/field";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { CACertificateUpload } from "@/components/mcp-servers/CACertificateUpload";
+import { NoneAuth } from "@/components/mcp-servers/NoneAuth";
+import { BasicAuth } from "@/components/mcp-servers/BasicAuth";
+import { BearerTokenAuth } from "@/components/mcp-servers/BearerTokenAuth";
+import { CustomHeadersAuth, type CustomHeader } from "@/components/mcp-servers/CustomHeadersAuth";
+import { OAuth2Auth } from "@/components/mcp-servers/OAuth2Auth";
+import { QueryParameterAuth } from "@/components/mcp-servers/QueryParameterAuth";
+import { useTeamScope } from "@/hooks/useTeams";
+import { STATUS_ICON } from "@/lib/status";
+import type { Visibility } from "@/types/server";
+import { VisibilityInfoContent } from "@/components/common/VisibilityInfoPopover";
+import { TeamSelect } from "@/components/common/TeamSelect";
+
+export type { CustomHeader };
+
+type AuthType = "none" | "basic" | "bearer" | "custom" | "oauth" | "query";
+
+interface AdvancedSettingsProps {
+  visibility: Visibility;
+  onVisibilityChange: (value: Visibility) => void;
+  teamId: string;
+  onTeamIdChange: (value: string) => void;
+  /** Validation message for the team field, shown on the selector. */
+  teamError?: string;
+  /** The server's own team, in edit mode. Pins the form to it. */
+  initialTeamId?: string;
+  authType: AuthType;
+  onAuthTypeChange: (value: AuthType) => void;
+  basicAuthUsername: string;
+  basicAuthPassword: string; // pragma: allowlist secret
+  onBasicAuthUsernameChange: (value: string) => void;
+  onBasicAuthPasswordChange: (value: string) => void;
+  bearerToken: string;
+  onBearerTokenChange: (value: string) => void;
+  customHeaders: CustomHeader[];
+  onCustomHeadersChange: (headers: CustomHeader[]) => void;
+  oauthClientId: string;
+  oauthClientSecret: string;
+  oauthTokenUrl: string;
+  oauthGrantType: string;
+  oauthIssuerUrl: string;
+  oauthRedirectUri: string;
+  isOAuthRedirectUriLoading?: boolean;
+  oauthRedirectUriError?: string;
+  onRetryOAuthRedirectUri?: () => void;
+  oauthAuthorizationUrl: string;
+  oauthScopes: string;
+  oauthResource: string;
+  oauthStoreTokens: boolean;
+  oauthAutoRefresh: boolean;
+  oauthUsername: string;
+  oauthPassword: string; // pragma: allowlist secret
+  onOAuthClientIdChange: (value: string) => void;
+  onOAuthClientSecretChange: (value: string) => void;
+  onOAuthTokenUrlChange: (value: string) => void;
+  onOAuthGrantTypeChange: (value: string) => void;
+  onOAuthIssuerUrlChange: (value: string) => void;
+  onOAuthAuthorizationUrlChange: (value: string) => void;
+  onOAuthScopesChange: (value: string) => void;
+  onOAuthResourceChange: (value: string) => void;
+  onOAuthStoreTokensChange: (checked: boolean) => void;
+  onOAuthAutoRefreshChange: (checked: boolean) => void;
+  onOAuthUsernameChange: (value: string) => void;
+  onOAuthPasswordChange: (value: string) => void;
+  queryParamName: string;
+  queryParamApiKey: string;
+  onQueryParamNameChange: (value: string) => void;
+  onQueryParamApiKeyChange: (value: string) => void;
+  oneTimeAuth: boolean; // pragma: allowlist secret
+  onOneTimeAuthChange: (checked: boolean) => void;
+  passthroughHeaders: string;
+  onPassthroughHeadersChange: (value: string) => void;
+  onCACertificateFilesSelected: (files: File[]) => void;
+  oauthErrors?: { username?: string; password?: string; resource?: string };
+}
+
+export function AdvancedSettings({
+  visibility,
+  onVisibilityChange,
+  teamId,
+  onTeamIdChange,
+  teamError,
+  initialTeamId,
+  authType,
+  onAuthTypeChange,
+  basicAuthUsername,
+  basicAuthPassword,
+  onBasicAuthUsernameChange,
+  onBasicAuthPasswordChange,
+  bearerToken,
+  onBearerTokenChange,
+  customHeaders,
+  onCustomHeadersChange,
+  oauthClientId,
+  oauthClientSecret,
+  oauthTokenUrl,
+  oauthGrantType,
+  oauthIssuerUrl,
+  oauthRedirectUri,
+  isOAuthRedirectUriLoading,
+  oauthRedirectUriError,
+  onRetryOAuthRedirectUri,
+  oauthAuthorizationUrl,
+  oauthScopes,
+  oauthResource,
+  oauthStoreTokens,
+  oauthAutoRefresh,
+  oauthUsername,
+  oauthPassword,
+  onOAuthClientIdChange,
+  onOAuthClientSecretChange,
+  onOAuthTokenUrlChange,
+  onOAuthGrantTypeChange,
+  onOAuthIssuerUrlChange,
+  onOAuthAuthorizationUrlChange,
+  onOAuthScopesChange,
+  onOAuthResourceChange,
+  onOAuthStoreTokensChange,
+  onOAuthAutoRefreshChange,
+  onOAuthUsernameChange,
+  onOAuthPasswordChange,
+  queryParamName,
+  queryParamApiKey,
+  onQueryParamNameChange,
+  onQueryParamApiKeyChange,
+  oneTimeAuth,
+  onOneTimeAuthChange,
+  passthroughHeaders,
+  onPassthroughHeadersChange,
+  onCACertificateFilesSelected,
+  oauthErrors,
+}: AdvancedSettingsProps) {
+  const intl = useIntl();
+  const { teams, onTeamChange } = useTeamScope({
+    visibility,
+    teamId,
+    onTeamIdChange,
+    recordTeamId: initialTeamId,
+  });
+
+  const renderAuthContent = () => {
+    switch (authType) {
+      case "none":
+        return <NoneAuth />;
+      case "basic":
+        return (
+          <BasicAuth
+            username={basicAuthUsername}
+            password={basicAuthPassword}
+            onUsernameChange={onBasicAuthUsernameChange}
+            onPasswordChange={onBasicAuthPasswordChange}
+          />
+        );
+      case "bearer":
+        return <BearerTokenAuth token={bearerToken} onTokenChange={onBearerTokenChange} />;
+      case "custom":
+        return (
+          <CustomHeadersAuth headers={customHeaders} onHeadersChange={onCustomHeadersChange} />
+        );
+      case "oauth":
+        return (
+          <OAuth2Auth
+            clientId={oauthClientId}
+            clientSecret={oauthClientSecret}
+            tokenUrl={oauthTokenUrl}
+            grantType={oauthGrantType}
+            issuerUrl={oauthIssuerUrl}
+            redirectUri={oauthRedirectUri}
+            isRedirectUriLoading={isOAuthRedirectUriLoading}
+            redirectUriError={oauthRedirectUriError}
+            onRetryRedirectUri={onRetryOAuthRedirectUri}
+            authorizationUrl={oauthAuthorizationUrl}
+            scopes={oauthScopes}
+            resource={oauthResource}
+            storeTokens={oauthStoreTokens}
+            autoRefresh={oauthAutoRefresh}
+            username={oauthUsername}
+            password={oauthPassword}
+            onClientIdChange={onOAuthClientIdChange}
+            onClientSecretChange={onOAuthClientSecretChange}
+            onTokenUrlChange={onOAuthTokenUrlChange}
+            onGrantTypeChange={onOAuthGrantTypeChange}
+            onIssuerUrlChange={onOAuthIssuerUrlChange}
+            onAuthorizationUrlChange={onOAuthAuthorizationUrlChange}
+            onScopesChange={onOAuthScopesChange}
+            onResourceChange={onOAuthResourceChange}
+            onStoreTokensChange={onOAuthStoreTokensChange}
+            onAutoRefreshChange={onOAuthAutoRefreshChange}
+            onUsernameChange={onOAuthUsernameChange}
+            onPasswordChange={onOAuthPasswordChange}
+            errors={oauthErrors}
+          />
+        );
+      case "query":
+        return (
+          <QueryParameterAuth
+            parameterName={queryParamName}
+            apiKey={queryParamApiKey}
+            onParameterNameChange={onQueryParamNameChange}
+            onApiKeyChange={onQueryParamApiKeyChange}
+          />
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="space-y-6 py-4">
+      {/* Visibility */}
+      <Field
+        id="visibility"
+        info={<VisibilityInfoContent />}
+        labelProps={{ className: "text-neutral-950 dark:text-white" }}
+        label={intl.formatMessage({ id: "gateways.createServer.visibility" })}
+      >
+        {(controlProps) => (
+          <Select value={visibility} onValueChange={onVisibilityChange}>
+            <SelectTrigger
+              {...controlProps}
+              className="h-10 w-full border-neutral-300 dark:border-neutral-700"
+            >
+              <SelectValue
+                placeholder={intl.formatMessage({ id: "mcpServer.advanced.visibilityPlaceholder" })}
+              />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="public">
+                {intl.formatMessage({ id: "common.visibility.internal" })}
+              </SelectItem>
+              <SelectItem value="private">
+                {intl.formatMessage({ id: "common.visibility.private" })}
+              </SelectItem>
+              <SelectItem value="team">
+                {intl.formatMessage({ id: "common.visibility.team" })}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+      </Field>
+
+      {visibility === "team" && (
+        <TeamSelect
+          id="server-team"
+          teams={teams}
+          value={teamId || undefined}
+          onChange={onTeamChange}
+          error={teamError}
+        />
+      )}
+
+      {/* Authentication type */}
+      <div className="space-y-3">
+        <Label id="auth-type-label" className="text-neutral-950 dark:text-white">
+          {intl.formatMessage({ id: "mcpServer.advanced.authTypeLabel" })}
+        </Label>
+        <div
+          role="radiogroup"
+          aria-labelledby="auth-type-label"
+          className="flex w-full flex-nowrap gap-1 rounded-md bg-neutral-100 p-1 dark:bg-neutral-800"
+        >
+          {(["none", "basic", "bearer", "custom", "oauth", "query"] as AuthType[]).map((type) => {
+            const label = intl.formatMessage({ id: `mcpServer.advanced.authType.${type}` });
+            const isLongerLabel = type === "custom" || type === "query";
+            return (
+              <div key={type} className={isLongerLabel ? "flex-[1.3] min-w-0" : "flex-1 min-w-0"}>
+                <input
+                  type="radio"
+                  id={`auth-${type}`}
+                  name="auth-type"
+                  value={type}
+                  checked={authType === type}
+                  onChange={(e) => onAuthTypeChange(e.target.value as AuthType)}
+                  className="sr-only peer"
+                />
+                <label
+                  htmlFor={`auth-${type}`}
+                  className="flex cursor-pointer items-center justify-center whitespace-nowrap rounded-md px-3 py-2 text-center text-sm font-medium text-neutral-500 transition hover:bg-neutral-200 hover:text-neutral-700 peer-checked:bg-neutral-800 peer-checked:text-white peer-checked:px-4 peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2 dark:text-neutral-400 dark:hover:bg-neutral-900 dark:hover:text-neutral-300 dark:peer-checked:bg-neutral-950 dark:peer-checked:text-white"
+                >
+                  {label}
+                </label>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Auth-specific content */}
+      {renderAuthContent()}
+
+      {/* One-time authentication */}
+      <Field
+        id="one-time-auth"
+        labelProps={{ className: "text-neutral-950 dark:text-white" }}
+        label={intl.formatMessage({ id: "mcpServer.advanced.oneTimeAuthLabel" })}
+      >
+        {(controlProps) => (
+          <>
+            <div className="flex items-center gap-3">
+              <Switch
+                {...controlProps}
+                checked={oneTimeAuth}
+                onCheckedChange={onOneTimeAuthChange}
+              />
+              <p
+                className={`text-sm ${oneTimeAuth ? "text-neutral-900 dark:text-neutral-100" : "text-neutral-600 dark:text-neutral-400"}`}
+              >
+                {intl.formatMessage({ id: "mcpServer.advanced.oneTimeAuthDescription" })}
+              </p>
+            </div>
+            {oneTimeAuth && (
+              <div className="mt-3 flex items-start gap-3 rounded-md bg-neutral-50 p-3 dark:bg-neutral-800">
+                <STATUS_ICON.warning className="text-warning mt-0.5 h-4 w-4 shrink-0" />
+                <p className="text-sm text-neutral-600 dark:text-neutral-400">
+                  {intl.formatMessage({ id: "mcpServer.advanced.oneTimeAuthWarning" })}
+                </p>
+              </div>
+            )}
+          </>
+        )}
+      </Field>
+
+      {/* Passthrough headers */}
+      <Field
+        id="passthrough-headers"
+        hint={intl.formatMessage({ id: "mcpServer.advanced.passthroughDescription" })}
+        labelProps={{ className: "text-neutral-950 dark:text-white" }}
+        label={intl.formatMessage({ id: "mcpServer.advanced.passthroughLabel" })}
+      >
+        {(controlProps) => (
+          <Textarea
+            {...controlProps}
+            value={passthroughHeaders}
+            onChange={(e) => onPassthroughHeadersChange(e.target.value)}
+            placeholder={intl.formatMessage({ id: "mcpServer.advanced.passthroughPlaceholder" })}
+            className="min-h-20 focus-visible:ring-1 focus-visible:ring-offset-0"
+          />
+        )}
+      </Field>
+
+      {/* CA certificate */}
+      <CACertificateUpload onFilesSelected={onCACertificateFilesSelected} />
+    </div>
+  );
+}

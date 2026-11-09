@@ -1,0 +1,312 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./vendor/shadcn.css";
+@import "@fontsource-variable/inter";
+/*
+ ---break---
+ */
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Map CSS custom properties to Tailwind v4 utilities via @theme inline.
+ * This lets components use classes like bg-sidebar, text-sidebar-foreground,
+ * ring-sidebar-ring, etc. without a tailwind.config.ts.
+ */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Main content area token */
+  --color-main: var(--main);
+
+  /* Sidebar-specific tokens */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --font-heading: var(--font-sans);
+  --font-sans: "Inter Variable", sans-serif;
+  /* Figma's `text-xxs` step, below Tailwind's built-in scale. */
+  --text-xxs: 10px;
+  --text-xxs--line-height: 16px;
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  /* Tool-specific semantic tokens */
+  --color-tool-icon-bg: var(--tool-icon-bg);
+  --color-prompt-icon-bg: var(--prompt-icon-bg);
+  --color-server-icon-bg: var(--server-icon-bg);
+  --color-agent-icon-bg: var(--agent-icon-bg);
+  --color-team-icon-bg: var(--team-icon-bg);
+  --color-catalog-icon-tile: var(--catalog-icon-tile);
+  --color-catalog-icon-backing: var(--catalog-icon-backing);
+  --color-tool-status-active: var(--tool-status-active);
+  --color-tool-status-inactive: var(--tool-status-inactive);
+  --color-tool-badge-bg: var(--tool-badge-bg);
+  --color-tool-badge-fg: var(--tool-badge-fg);
+  --color-tool-add-icon-bg: var(--tool-add-icon-bg);
+  --color-tool-add-icon-fg: var(--tool-add-icon-fg);
+
+  /* Selection / emphasis accent (source cards, highlights) */
+  --color-selection: var(--selection);
+
+  /* Status-headline icon accent */
+  --color-status-icon: var(--status-icon);
+
+  /* Sparkline stroke. Separate from --status-icon because a 1px line has to
+     clear 3:1 as a non-text graphic, which cyan-500 does not on white. */
+  --color-sparkline-stroke: var(--sparkline-stroke);
+
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Light theme */
+:root {
+  /* Tells the browser which palette to paint native UI with — scrollbars, form
+     controls, the caret. Without it the .dark class swaps our custom properties
+     but leaves that chrome light. */
+  color-scheme: light;
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+
+  --radius: 0.625rem;
+
+  /* Main content area — slightly off-white to distinguish from sidebar */
+  --main: oklch(0.985 0 0);
+
+  /* Sidebar — white */
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+  --card: oklch(0.985 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  /* Semantic status colors — success/warning icons and badges read these
+     instead of a raw Tailwind shade, so every call site stays in sync. */
+  --success: var(--color-green-600);
+  --warning: var(--color-amber-600);
+  /* Badge text sits on the token's own 15% tint, which needs 4.5:1 — the
+     600 shades above only clear the 3:1 bar icons need. 700 shades cover
+     both; dark mode already passes at --success/--warning (see #94). */
+  --success-foreground: var(--color-green-700);
+  --warning-foreground: var(--color-amber-700);
+  --tool-icon-bg: var(--color-fuchsia-400);
+  --prompt-icon-bg: #6fff9f;
+  /* Brand cyan. Like the two above it this is a chip *background* carrying a
+     black glyph, so it needs no `.dark` override — only `--status-icon`, which
+     paints a foreground, has to step down on white. */
+  --server-icon-bg: #70f9ff;
+  /* Same rationale as the icon-bg tokens above: a chip background carrying a
+     black glyph, no `.dark` override needed. */
+  --agent-icon-bg: #ffc078;
+  /* Same rationale again: a chip background carrying a black glyph, so no
+     `.dark` override. Brand cyan, as on the status headline. */
+  --team-icon-bg: #70f9ff;
+  --catalog-icon-tile: oklch(1 0 0);
+  --catalog-icon-backing: var(--color-white);
+  /* emerald-400 falls under 3:1 on white; .dark restores it */
+  --tool-status-active: var(--color-emerald-600);
+  --tool-status-inactive: var(--color-neutral-500);
+  --tool-badge-bg: var(--color-neutral-200);
+  --tool-badge-fg: var(--color-neutral-800);
+  --tool-add-icon-bg: var(--color-neutral-900);
+  --tool-add-icon-fg: var(--color-white);
+  /* Status-headline icon accent — cyan for the light background; the .dark
+     override restores the brand cyan (#70f9ff). */
+  --status-icon: var(--color-cyan-500);
+  --sparkline-stroke: var(--color-cyan-700);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+
+  /* Selection accent — warm orange for selected/hovered surfaces */
+  --selection: var(--color-orange-500);
+}
+/*
+ ---break---
+ */
+.dark {
+  color-scheme: dark;
+
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --success: var(--color-green-400);
+  --warning: var(--color-amber-400);
+  --success-foreground: var(--color-green-400);
+  --warning-foreground: var(--color-amber-400);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --main: oklch(0.205 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+  --tool-badge-bg: var(--color-neutral-800);
+  --tool-badge-fg: var(--color-white);
+  --tool-add-icon-bg: var(--color-white);
+  --tool-add-icon-fg: var(--color-neutral-900);
+  --tool-status-active: var(--color-emerald-400);
+  --selection: var(--color-orange-500);
+  --catalog-icon-tile: oklch(0.269 0 0);
+  --catalog-icon-backing: var(--color-neutral-300);
+  /* Status-headline icon accent (brand cyan) — bright on the dark background. */
+  --status-icon: #70f9ff;
+  --sparkline-stroke: #70f9ff;
+}
+/* A transparent track so the scrollbar doesn't paint a solid bar over the
+   rounded corners of the box it scrolls in. */
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted-foreground) transparent;
+}
+
+/* The `html` rule below reserves the gutter for the document scrollbar only.
+   `scrollbar-gutter` applies to the box it is set on, so nested scroll
+   containers need their own, or their content reflows whenever it crosses the
+   container's height. The Safari < 18.2 fallback is at the bottom of the file. */
+@utility scrollbar-gutter-stable {
+  scrollbar-gutter: stable;
+}
+
+/*
+ ---break---
+ */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+    /* Reserve the scrollbar gutter so pages that gain/lose a document scrollbar
+       don't shift centered content when their height crosses the viewport. */
+    scrollbar-gutter: stable;
+  }
+}
+
+/* Set here instead of as a "leading-none" utility on the component: twMerge
+   treats line-height utilities as conflicting with font-size ones, so a
+   call-site "text-sm" would silently strip "leading-none" from the class
+   string. A CSS rule can't be stripped by className merging.
+   Unlayered on purpose: Tailwind emits `.text-sm` (with its own line-height)
+   into `@layer utilities`, which under cascade layers beats any rule in
+   `@layer components` regardless of specificity — this has to stay outside
+   any layer to outrank it.
+   :not([class*="leading-"]) scopes this to labels that don't already ask for
+   a line-height: being unlayered means this would otherwise beat *any*
+   layered rule unconditionally (layer order trumps specificity), permanently
+   blocking a caller's own "leading-relaxed" etc. */
+[data-slot="label"]:not([class*="leading-"]) {
+  line-height: 1;
+}
+
+/* Fallback for browsers without scrollbar-gutter (Safari < 18.2): always reserve
+   a classic scrollbar track. No effect where scrollbar-gutter is supported.
+   Unlayered on purpose: Tailwind emits `.overflow-y-auto` into `@layer
+   utilities`, which these rules have to outrank at equal specificity. */
+@supports not (scrollbar-gutter: stable) {
+  html,
+  .scrollbar-gutter-stable {
+    overflow-y: scroll;
+  }
+}
+
+/* Radix dialogs lock the page through react-remove-scroll, which puts a
+   margin-right the width of the scrollbar on the body to compensate for the
+   scrollbar it expects to hide. Both rules above keep that space reserved for
+   the whole session, so the compensation double-counts and shifts the page left
+   as a dialog opens. Zero it out; the gutter already holds the space.
+   The injected rule is `body[data-scroll-locked] { margin-right: Npx !important }`
+   and lands later in the cascade, so this needs the extra specificity to win. */
+html body[data-scroll-locked] {
+  margin-right: 0 !important;
+}

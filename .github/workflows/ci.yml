@@ -1,0 +1,45 @@
+name: Verify AgentPort
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install uv==0.13.7
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check --config pyproject.toml src tests scripts examples
+      - run: uv run pytest -q
+      - run: AOG_INTEGRATION=1 uv run pytest tests/test_http_integration.py -q
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run: {working-directory: dashboard}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: "24"}
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test -- --maxWorkers=2
+      - run: npm ci --ignore-scripts && npm run build && npm run test:run -- --maxWorkers=2
+        working-directory: dashboard/server
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install httpx python-dotenv
+      - run: python scripts/init-compose.py
+      - run: python -c 'from pathlib import Path; p=Path(".env"); p.write_text(p.read_text()+"PASSWORD_CHANGE_ENFORCEMENT_ENABLED=false\n")'
+      - run: docker compose --profile demo config --quiet
+      - run: docker compose --profile demo up -d --build
+      - run: python scripts/smoke-compose.py
+      - if: failure()
+        run: docker compose logs --tail 80 gateway dashboard converter
+      - if: always()
+        run: docker compose --profile demo down -v

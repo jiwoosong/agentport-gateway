@@ -1,0 +1,67 @@
+// Location: ./client/server/src/routes/auth/logout.ts
+// Copyright contributors to the MCP-CONTEXT-FORGE project
+// SPDX-License-Identifier: Apache-2.0
+//
+// POST /auth/logout: CSRF-protected like any other state-changing
+// browser->BFF call. Idempotent w.r.t. session state — clears cookies and
+// drops the Redis session even if session_id is already missing/expired
+// (double-click or retry), as long as the caller still holds a valid CSRF
+// cookie/token pair.
+//
+// Also revokes the upstream JWT itself via FastAPI's bearer-token logout
+// (mcpgateway/routers/auth.py POST /auth/logout, blocklist-backed —
+// DB or Redis depending on deployment). Without this, dropping the BFF's
+// own session/cookie only makes the token unreachable from the browser;
+// the JWT stays cryptographically valid until its natural TOKEN_EXPIRY.
+// Best-effort: an upstream failure (network blip, already-revoked token)
+// must not block the BFF-side logout the user is waiting on.
+//
+// SSO sessions also get a best-effort back-channel RP-Initiated Logout
+// against Keycloak (see lib/sso-back-channel-logout.ts) -- otherwise the
+// Keycloak refresh_token/IdP session stays live and a later
+// /auth/sso/login silently re-authenticates the user. No-op for
+// password-login sessions, which never carry an idToken.
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
+import { config } from "../../config.js";
+import {
+  clearSessionCookie,
+  deleteSession,
+  getSession,
+  SESSION_COOKIE_NAME,
+} from "../../lib/session-store.js";
+import { CSRF_COOKIE_NAME } from "../../plugins/csrf.js";
+import { backChannelLogoutSso } from "../../lib/sso-back-channel-logout.js";
+import { revokeUpstreamToken } from "../../lib/revoke-upstream-token.js";
+import { setNoStore } from "../../lib/no-store.js";
+
+export default async function logoutRoute(fastify: FastifyInstance): Promise<void> {
+  fastify.post(
+    "/auth/logout",
+    { preHandler: [fastify.csrfProtection] },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      setNoStore(reply);
+
+      const sessionId = request.cookies[SESSION_COOKIE_NAME];
+      if (sessionId) {
+        const record = await getSession(fastify.redis, sessionId);
+        // Drop the BFF session first: the upstream revoke is best-effort and
+        // must not leave a live session behind if it stalls or throws.
+        await deleteSession(fastify.redis, sessionId);
+        if (record) {
+          await Promise.all([
+            revokeUpstreamToken(request, record.bearerToken),
+            ...(record.idToken ? [backChannelLogoutSso(request, record.idToken)] : []),
+          ]);
+        }
+      }
+
+      clearSessionCookie(reply);
+      // domain must match csrf.ts's setCookie or this clear is a no-op under COOKIE_DOMAIN.
+      reply.clearCookie(CSRF_COOKIE_NAME, { path: "/", domain: config.cookieDomain });
+
+      return reply.send({ ok: true });
+    },
+  );
+}

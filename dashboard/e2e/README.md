@@ -1,0 +1,143 @@
+# E2E Tests (Playwright + TypeScript)
+
+End-to-end tests for the ContextForge React admin UI, written in TypeScript with
+[Playwright](https://playwright.dev/). They share types and conventions with the
+client code under `src/` and run without requiring the Python gateway backend:
+API responses are stubbed per-test with `page.route()`.
+
+## Layout
+
+```
+e2e/
+├── fixtures/
+│   ├── api-mock.ts         # `test` with `apiMock` helper (page.route wrappers)
+│   └── auth.ts             # `test` with a pre-authenticated page (session token)
+├── smoke/                  # Fast checks on every PR — no backend, no auth
+│   ├── app-loads.spec.ts
+│   ├── auth-redirect.spec.ts
+│   └── static-assets.spec.ts
+├── auth/                   # Authentication & session flows
+│   ├── login-flow.spec.ts
+│   ├── forgot-password.spec.ts
+│   └── session.spec.ts
+├── utils/
+│   └── paths.ts            # Route + API path constants (mirror src/router)
+└── README.md
+```
+
+## Running
+
+Install the Playwright browsers once per machine:
+
+```bash
+npm run e2e:install
+```
+
+Then, from `client/`:
+
+```bash
+npm run e2e             # Headless run against the Vite dev server
+npm run e2e:ui          # Interactive UI mode (great for authoring)
+npm run e2e:debug       # Step through with the Playwright Inspector
+npm run e2e:report      # Open the last HTML report
+```
+
+The config spawns `npm run dev:e2e` (Vite with `--base=/`) on port `5173` and
+tears it down after the run. Set `PLAYWRIGHT_BASE_URL` to point tests at an
+existing server instead:
+
+```bash
+PLAYWRIGHT_BASE_URL=http://localhost:4444 PLAYWRIGHT_SKIP_WEBSERVER=1 npm run e2e
+```
+
+### Real-backend mode (`e2e:docker`)
+
+`npm run e2e:docker` runs the same suite against a real backend instead of
+`page.route()` stubs: `docker-compose.e2e.yml` is a standalone stack (`app`,
+`redis`, and a real gateway — official `ghcr.io/ibm/mcp-context-forge`
+image), entirely independent of `docker-compose.yml` and under its own
+`e2e` Compose project, so it can never collide with a plain dev stack's
+containers or volumes either way. It seeds a login user, runs the suite
+against the containers (`E2E_REAL_API=true`), then tears the stack down.
+The `apiMock`/`auth` fixtures skip stubbing for the success path in this
+mode; the auth fixture logs in for real using
+`E2E_TEST_EMAIL`/`E2E_TEST_PASSWORD`.
+
+```bash
+npm run e2e:docker
+```
+
+Requires `E2E_TEST_EMAIL`/`E2E_TEST_PASSWORD` set in `.env` — the seed
+script bootstraps that user as the gateway's admin (22+ chars, no email
+local-part — see `.env.example`).
+
+The `gateway` image tag in `docker-compose.e2e.yml` is pinned to match
+`openapi.json`'s `info.version` — bump both together.
+
+### TLS variant (`e2e:docker:tls`)
+
+`npm run e2e:docker:tls` runs the same real-backend suite with TLS on
+every hop: Playwright → nginx (`https://localhost:8443`) → BFF → gateway
+(`https://gateway:4444`). Stacks `docker-compose.e2e.yml` with
+`docker-compose.tls.yml` and `docker-compose.e2e-tls.yml` — reusing
+`cert_init`/`nginx_tls`/the app's TLS env from the latter, and switching
+the gateway itself to serve HTTPS. Same seed and credentials as
+`e2e:docker`, just over TLS.
+
+Requires `E2E_TEST_EMAIL`/`E2E_TEST_PASSWORD` set in `.env` beforehand,
+same as `e2e:docker` (see above) — the seed step fails without them.
+
+```bash
+cp .env.example .env   # if you don't already have one
+npm run e2e:docker:tls
+```
+
+## Writing a new test
+
+Import the `test` and `expect` helpers from the fixture that matches your needs:
+
+```ts
+// Unauthenticated / public flows
+import { test, expect } from "../fixtures/api-mock";
+
+// Authenticated flows (/auth/session mocked as a valid BFF session)
+import { test, expect } from "../fixtures/auth";
+```
+
+Mock API endpoints through the `apiMock` fixture rather than calling
+`page.route()` directly, so payload shapes stay in sync with `AuthContext`:
+
+```ts
+test("rejects wrong password", async ({ page, apiMock }) => {
+  await apiMock.mockLogin({ status: 401 });
+  await page.goto("/app/login");
+  // ...
+});
+```
+
+Prefer role- and label-based locators (`getByRole`, `getByLabel`) over CSS
+selectors — they survive refactors and double as accessibility checks.
+
+Keep smoke tests:
+
+- Deterministic (no reliance on real network / time)
+- Under a second per test on a warm dev server
+- Tied to user-visible behaviour, not implementation details
+
+## CI
+
+Runs in
+[`.github/workflows/client-e2e.yml`](../../.github/workflows/client-e2e.yml) on
+PRs and pushes to `main` / `epic/ui-rewrite` that touch `client/**`.
+
+## Troubleshooting
+
+- **`Error: Timed out waiting for ... to be visible`** — check the locator in UI
+  mode (`npm run e2e:ui`) and confirm the mock returns what the UI expects.
+- **Tests that pass locally but flake in CI** — add a `page.waitForLoadState`,
+  tighten the mock's payload, or widen the retry count in the config for the
+  specific test. Do not add arbitrary `waitForTimeout` calls.
+- **Mock not firing** — `page.route()` patterns use glob syntax. `"**/auth/session"`
+  is the supported form; a leading `/` anchors to the origin only. `**` spans
+  path segments, so it matches regardless of the `/api/*` prefix the BFF
+  proxy adds to non-auth calls (see `client/src/api/client.ts`).

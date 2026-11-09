@@ -1,0 +1,382 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { screen, fireEvent, act } from "@testing-library/react";
+import { renderWithProviders as render } from "@/test/test-utils";
+import { OAuth2Auth } from "./OAuth2Auth";
+
+describe("OAuth2Auth", () => {
+  const defaultProps = {
+    grantType: "client_credentials",
+    issuerUrl: "",
+    redirectUri: "",
+    clientId: "",
+    clientSecret: "", // pragma: allowlist secret
+    tokenUrl: "",
+    authorizationUrl: "",
+    scopes: "",
+    resource: "",
+    storeTokens: true,
+    autoRefresh: true,
+    username: "",
+    password: "", // pragma: allowlist secret
+    onGrantTypeChange: vi.fn(),
+    onIssuerUrlChange: vi.fn(),
+    onClientIdChange: vi.fn(),
+    onClientSecretChange: vi.fn(),
+    onTokenUrlChange: vi.fn(),
+    onAuthorizationUrlChange: vi.fn(),
+    onScopesChange: vi.fn(),
+    onResourceChange: vi.fn(),
+    onStoreTokensChange: vi.fn(),
+    onAutoRefreshChange: vi.fn(),
+    onUsernameChange: vi.fn(),
+    onPasswordChange: vi.fn(),
+  };
+
+  it("should render client_credentials fields by default", () => {
+    render(<OAuth2Auth {...defaultProps} />);
+
+    expect(screen.getByLabelText(/Grant type/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Issuer URL/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Client ID/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Client Secret/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Token URL/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Scopes/i)).toBeInTheDocument();
+
+    // Checkboxes
+    expect(screen.getByLabelText(/Store access tokens for reuse/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Automatically refresh expired tokens/i)).toBeInTheDocument();
+
+    // Fields that should NOT be visible for client_credentials
+    expect(screen.queryByLabelText(/Redirect URI/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Authorization URL/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Username/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Password/i)).not.toBeInTheDocument();
+  });
+
+  it("should not mark Issuer URL and Token URL as required (mcp-context-forge#6467)", () => {
+    // Neither field is actually required: they're alternatives (discovery
+    // via the issuer can derive the token URL, or the token URL can be
+    // supplied directly), and mcpServerFormSchema (useMCPServerForm.ts)
+    // never enforces their presence.
+    render(<OAuth2Auth {...defaultProps} />);
+
+    const issuerLabel = document.querySelector("label[for='oauth-issuer-url']");
+    const tokenLabel = document.querySelector("label[for='oauth-token-url']");
+    expect(issuerLabel).toHaveTextContent("Issuer URL");
+    expect(issuerLabel).not.toHaveTextContent("*");
+    expect(issuerLabel).not.toHaveTextContent("(required)");
+    expect(tokenLabel).toHaveTextContent("Token URL");
+    expect(tokenLabel).not.toHaveTextContent("*");
+    expect(tokenLabel).not.toHaveTextContent("(required)");
+
+    // Grant type is genuinely required and should keep its indicator.
+    const grantTypeLabel = document.querySelector("label[for='oauth-grant-type']");
+    expect(grantTypeLabel).toHaveTextContent("(required)");
+  });
+
+  it("should render authorization_code fields", () => {
+    render(<OAuth2Auth {...defaultProps} grantType="authorization_code" />);
+
+    expect(screen.getByLabelText(/Redirect URI/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Authorization URL/i)).toBeInTheDocument();
+
+    expect(screen.queryByLabelText(/Username/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Password/i)).not.toBeInTheDocument();
+  });
+
+  it("should render password fields", () => {
+    render(<OAuth2Auth {...defaultProps} grantType="password" />);
+
+    expect(screen.getByLabelText(/Username/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Password/i)).toBeInTheDocument();
+
+    expect(screen.queryByLabelText(/Redirect URI/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Authorization URL/i)).not.toBeInTheDocument();
+  });
+
+  it("should display errors for username and password in password grant", () => {
+    render(
+      <OAuth2Auth
+        {...defaultProps}
+        grantType="password"
+        errors={{ username: "Username is required", password: "Password is required" }} // pragma: allowlist secret
+      />,
+    );
+
+    expect(screen.getByText("Username is required")).toBeInTheDocument();
+    expect(screen.getByText("Password is required")).toBeInTheDocument();
+  });
+
+  it("should trigger callbacks when fields are updated", () => {
+    const onIssuerUrlChange = vi.fn();
+    const onClientIdChange = vi.fn();
+    const onClientSecretChange = vi.fn();
+    const onTokenUrlChange = vi.fn();
+    const onScopesChange = vi.fn();
+
+    render(
+      <OAuth2Auth
+        {...defaultProps}
+        onIssuerUrlChange={onIssuerUrlChange}
+        onClientIdChange={onClientIdChange}
+        onClientSecretChange={onClientSecretChange}
+        onTokenUrlChange={onTokenUrlChange}
+        onScopesChange={onScopesChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText(/Issuer URL/i), {
+      target: { value: "https://auth.example.com" },
+    });
+    expect(onIssuerUrlChange).toHaveBeenCalledWith("https://auth.example.com");
+
+    fireEvent.change(screen.getByLabelText(/Client ID/i), { target: { value: "my-client-id" } });
+    expect(onClientIdChange).toHaveBeenCalledWith("my-client-id");
+
+    fireEvent.change(screen.getByLabelText(/Client Secret/i), {
+      target: { value: "my-client-secret" },
+    });
+    expect(onClientSecretChange).toHaveBeenCalledWith("my-client-secret");
+
+    fireEvent.change(screen.getByLabelText(/Token URL/i), {
+      target: { value: "https://auth.example.com/token" },
+    });
+    expect(onTokenUrlChange).toHaveBeenCalledWith("https://auth.example.com/token");
+
+    fireEvent.change(screen.getByLabelText(/Scopes/i), { target: { value: "read write" } });
+    expect(onScopesChange).toHaveBeenCalledWith("read write");
+  });
+
+  it("should trigger callbacks for password grant fields", () => {
+    const onUsernameChange = vi.fn();
+    const onPasswordChange = vi.fn();
+
+    render(
+      <OAuth2Auth
+        {...defaultProps}
+        grantType="password"
+        onUsernameChange={onUsernameChange}
+        onPasswordChange={onPasswordChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText(/Username/i), { target: { value: "test-user" } });
+    expect(onUsernameChange).toHaveBeenCalledWith("test-user");
+
+    fireEvent.change(screen.getByLabelText(/Password/i), { target: { value: "test-pass" } });
+    expect(onPasswordChange).toHaveBeenCalledWith("test-pass");
+  });
+
+  it("shows an auto-placeholder (not window.location.origin) with no stored redirect URI", () => {
+    const onAuthorizationUrlChange = vi.fn();
+
+    render(
+      <OAuth2Auth
+        {...defaultProps}
+        grantType="authorization_code"
+        onAuthorizationUrlChange={onAuthorizationUrlChange}
+      />,
+    );
+
+    const redirect = screen.getByLabelText(/Redirect URI/i);
+    expect(redirect).toHaveAttribute("readonly");
+    // The web UI's own origin is not where the gateway serves /oauth/callback
+    // in a split deployment (mcp-context-forge#6458) -- must never display or
+    // submit it as a guess.
+    expect(redirect).not.toHaveValue(`${window.location.origin}/oauth/callback`);
+    expect(screen.queryByRole("button", { name: "Copy to clipboard" })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/Authorization URL/i), {
+      target: { value: "https://auth.com/authorize" },
+    });
+    expect(onAuthorizationUrlChange).toHaveBeenCalledWith("https://auth.com/authorize");
+  });
+
+  it("displays a stored redirect URI verbatim", () => {
+    render(
+      <OAuth2Auth
+        {...defaultProps}
+        grantType="authorization_code"
+        redirectUri="https://public.example.com/oauth/callback"
+      />,
+    );
+
+    expect(screen.getByLabelText(/Redirect URI/i)).toHaveValue(
+      "https://public.example.com/oauth/callback",
+    );
+  });
+
+  describe("DCR hint", () => {
+    // DCR (Dynamic Client Registration) only runs for the authorization-code
+    // flow (backend /oauth/authorize/{gateway_id}). Showing the hint for
+    // other grant types invited users to leave Client ID/Secret blank for
+    // client_credentials, which fails registration outright (mcp-context-forge#6466).
+    it("is not shown for client_credentials", () => {
+      render(<OAuth2Auth {...defaultProps} grantType="client_credentials" />);
+
+      expect(
+        screen.queryByText(/Some authorization servers issue these automatically/i),
+      ).not.toBeInTheDocument();
+    });
+
+    it("is not shown for password grant", () => {
+      render(<OAuth2Auth {...defaultProps} grantType="password" />);
+
+      expect(
+        screen.queryByText(/Some authorization servers issue these automatically/i),
+      ).not.toBeInTheDocument();
+    });
+
+    it("is shown under both Client ID and Client Secret for authorization_code", () => {
+      render(<OAuth2Auth {...defaultProps} grantType="authorization_code" />);
+
+      expect(
+        screen.getAllByText(/Some authorization servers issue these automatically/i),
+      ).toHaveLength(2);
+    });
+  });
+
+  it("only offers the password grant option when already selected (legacy)", () => {
+    const { rerender } = render(<OAuth2Auth {...defaultProps} grantType="client_credentials" />);
+    expect(screen.queryByText(/Password grant is deprecated/i)).not.toBeInTheDocument();
+
+    rerender(<OAuth2Auth {...defaultProps} grantType="password" />);
+    expect(screen.getByText(/Password grant is deprecated/i)).toBeInTheDocument();
+  });
+
+  it("should trigger checkbox callback functions", () => {
+    const onStoreTokensChange = vi.fn();
+    const onAutoRefreshChange = vi.fn();
+
+    render(
+      <OAuth2Auth
+        {...defaultProps}
+        onStoreTokensChange={onStoreTokensChange}
+        onAutoRefreshChange={onAutoRefreshChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText(/Store access tokens for reuse/i));
+    expect(onStoreTokensChange).toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText(/Automatically refresh expired tokens/i));
+    expect(onAutoRefreshChange).toHaveBeenCalled();
+  });
+
+  describe("advanced resource override", () => {
+    it("is hidden until Advanced OAuth options is expanded", () => {
+      render(<OAuth2Auth {...defaultProps} />);
+
+      expect(screen.queryByLabelText(/Resource override/i)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Advanced OAuth options/i }));
+      expect(screen.getByLabelText(/Resource override/i)).toBeInTheDocument();
+    });
+
+    it("opens automatically for a stored override and reports changes", () => {
+      const onResourceChange = vi.fn();
+      render(
+        <OAuth2Auth
+          {...defaultProps}
+          resource="https://api.example.com"
+          onResourceChange={onResourceChange}
+        />,
+      );
+
+      const input = screen.getByLabelText(/Resource override/i);
+      expect(input).toHaveValue("https://api.example.com");
+      fireEvent.change(input, { target: { value: "https://other.example.com" } });
+      expect(onResourceChange).toHaveBeenCalledWith("https://other.example.com");
+    });
+  });
+
+  describe("copy button interaction", () => {
+    beforeEach(() => {
+      Object.assign(navigator, {
+        clipboard: { writeText: vi.fn().mockResolvedValue(undefined) },
+      });
+    });
+
+    it("copies a stored redirect URI to clipboard when the copy button is clicked", async () => {
+      render(
+        <OAuth2Auth
+          {...defaultProps}
+          grantType="authorization_code"
+          redirectUri="https://public.example.com/oauth/callback"
+        />,
+      );
+
+      const copyButton = screen.getByRole("button", { name: /Copy to clipboard/i });
+      await act(async () => {
+        fireEvent.click(copyButton);
+      });
+
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+        "https://public.example.com/oauth/callback",
+      );
+    });
+
+    it("shows a check icon immediately after clicking copy and reverts after 2 s", async () => {
+      vi.useFakeTimers();
+
+      render(
+        <OAuth2Auth
+          {...defaultProps}
+          grantType="authorization_code"
+          redirectUri="https://public.example.com/oauth/callback"
+        />,
+      );
+
+      const copyButton = screen.getByRole("button", { name: /Copy to clipboard/i });
+      await act(async () => {
+        fireEvent.click(copyButton);
+      });
+
+      // The button is still present (aria-label unchanged; icon swap is visual-only)
+      expect(copyButton).toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      vi.useRealTimers();
+    });
+  });
+
+  describe("localhost warning", () => {
+    it("does not show the localhost warning with no stored redirect URI, even though jsdom's own origin is localhost", () => {
+      // jsdom sets window.location.origin to 'http://localhost' -- must not
+      // leak into the warning now that nothing is derived from it.
+      render(<OAuth2Auth {...defaultProps} grantType="authorization_code" />);
+
+      expect(
+        screen.queryByText(/will not work for external OAuth providers/i),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not show the localhost warning when a non-localhost stored redirect URI is used", () => {
+      render(
+        <OAuth2Auth
+          {...defaultProps}
+          grantType="authorization_code"
+          redirectUri="https://public.example.com/oauth/callback"
+        />,
+      );
+
+      expect(
+        screen.queryByText(/will not work for external OAuth providers/i),
+      ).not.toBeInTheDocument();
+    });
+
+    it("shows the localhost warning when a stored redirect URI points to 127.0.0.1", () => {
+      render(
+        <OAuth2Auth
+          {...defaultProps}
+          grantType="authorization_code"
+          redirectUri="http://127.0.0.1:8080/oauth/callback"
+        />,
+      );
+
+      expect(screen.getByText(/will not work for external OAuth providers/i)).toBeInTheDocument();
+    });
+  });
+});

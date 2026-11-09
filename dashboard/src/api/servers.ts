@@ -1,0 +1,304 @@
+/**
+ * MCP Servers API service
+ *
+ * Wraps /v1/mcp-servers backend endpoint but exposes as "servers" API
+ * for frontend consistency.
+ */
+
+import { api } from "./client";
+import type { ServersResponse, MCPServer } from "../types/server";
+import type {
+  GatewayHandshakeRequest,
+  GatewayHandshakeResponse,
+  GatewayRefreshResponse,
+  GatewayTestRequest,
+  GatewayTestResponse,
+} from "@/generated/types";
+import { validateServerId } from "@/utils/serverId";
+
+const serverByIdRequestCache = new Map<string, Promise<MCPServer>>();
+
+/** The user closed the OAuth popup. Typed so callers can stay quiet about it. */
+export class OAuthCancelledError extends Error {
+  constructor() {
+    super("OAuth authorization was cancelled");
+    this.name = "OAuthCancelledError";
+  }
+}
+
+function openOAuthAuthorizationPopup(): Window {
+  const width = 600;
+  const height = 700;
+  const left = window.screenX + (window.outerWidth - width) / 2;
+  const top = window.screenY + (window.outerHeight - height) / 2;
+  const authWindow = window.open(
+    "",
+    "oauth_authorization",
+    `width=${width},height=${height},left=${left},top=${top},toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes`,
+  );
+
+  if (!authWindow) {
+    throw new Error(
+      "Failed to open OAuth authorization window. Please check your popup blocker settings.",
+    );
+  }
+
+  return authWindow;
+}
+
+export const serversApi = {
+  /**
+   * List all MCP servers with cursor-based pagination
+   */
+  list: (params?: {
+    cursor?: string;
+    limit?: number;
+    include_inactive?: boolean;
+    signal?: AbortSignal;
+  }): Promise<ServersResponse> => {
+    const searchParams = new URLSearchParams();
+
+    // Add cursor if provided
+    if (params?.cursor) {
+      searchParams.set("cursor", params.cursor);
+    }
+
+    // Validate and clamp limit (1-100)
+    if (params?.limit !== undefined) {
+      const limit = Number.isFinite(params.limit)
+        ? Math.max(1, Math.min(100, Math.floor(params.limit)))
+        : 25;
+      searchParams.set("limit", limit.toString());
+    }
+
+    if (params?.include_inactive) {
+      searchParams.set("include_inactive", "true");
+    }
+
+    // Always request pagination metadata to get structured response
+    searchParams.set("include_pagination", "true");
+
+    const query = searchParams.toString();
+    return api.get(`/v1/mcp-servers${query ? `?${query}` : ""}`, undefined, params?.signal);
+  },
+
+  /**
+   * Get a single MCP server by ID
+   */
+  get: (id: string): Promise<MCPServer> => {
+    const validId = validateServerId(id);
+
+    const cachedRequest = serverByIdRequestCache.get(validId);
+    if (cachedRequest) {
+      return cachedRequest;
+    }
+
+    const request = api.get<MCPServer>(`/v1/mcp-servers/${validId}`);
+    serverByIdRequestCache.set(validId, request);
+
+    request.catch(() => {
+      serverByIdRequestCache.delete(validId);
+    });
+
+    return request;
+  },
+
+  /**
+   * Delete an MCP server
+   */
+  delete: (id: string): Promise<void> => {
+    const validId = validateServerId(id);
+    return api.delete(`/v1/mcp-servers/${validId}`);
+  },
+
+  /**
+   * Replace an MCP server's (gateway's) tags.
+   *
+   * Sends a partial `PUT /v1/mcp-servers/{id}` carrying only `tags`; the gateway
+   * update service preserves every other field when it is omitted. Returns the
+   * updated server so callers can patch their cache with the normalized tags.
+   */
+  updateTags: (id: string, tags: string[]): Promise<MCPServer> => {
+    const validId = validateServerId(id);
+    return api.put<MCPServer>(`/v1/mcp-servers/${validId}`, { tags });
+  },
+
+  /**
+   * Test connection to an MCP server
+   */
+  testConnection: (id: string): Promise<{ success: boolean; message: string }> => {
+    const validId = validateServerId(id);
+    return api.post(`/v1/mcp-servers/${validId}/test`, {});
+  },
+
+  /**
+   * Test ad-hoc connectivity to an MCP server / gateway URL.
+   *
+   * Unlike {@link testConnection} (which pings an already-registered server by
+   * ID), this sends a caller-supplied request (URL, method, path, headers, body)
+   * to the v1 REST endpoint and returns the upstream response. The React UI must
+   * use this rather than the legacy /admin/gateways/test route.
+   */
+  testConnectivity: (
+    request: GatewayTestRequest,
+    signal?: AbortSignal,
+  ): Promise<GatewayTestResponse> => {
+    return api.post("/v1/mcp-servers/test", request, { signal });
+  },
+
+  /**
+   * Test whether an MCP server URL speaks MCP via a protocol handshake.
+   *
+   * Tries the stateless server/discover method (MCP 2026-07-28+) first and
+   * falls back to a stateful initialize round-trip for earlier specs.
+   *
+   * Calls POST /v1/mcp-servers/test-handshake. Returns a structured
+   * GatewayHandshakeResponse describing the negotiation outcome.
+   */
+  testHandshake: (
+    request: GatewayHandshakeRequest,
+    signal?: AbortSignal,
+  ): Promise<GatewayHandshakeResponse> => {
+    return api.post("/v1/mcp-servers/test-handshake", request, { signal });
+  },
+
+  /**
+   * Toggle the enabled state of an MCP server (activate/deactivate)
+   */
+  toggleEnabled: (id: string, enabled: boolean): Promise<{ status: string; message: string }> => {
+    const validId = validateServerId(id);
+    return api.post(`/v1/mcp-servers/${validId}/state?activate=${enabled}`);
+  },
+
+  /**
+   * Re-sync a server's tools, resources, and prompts from the upstream MCP server.
+   *
+   * Unversioned path to match every other call in this file — see Issue #6550.
+   */
+  refreshTools: (id: string): Promise<GatewayRefreshResponse> => {
+    const validId = validateServerId(id);
+    return api.post(
+      `/gateways/${validId}/tools/refresh?include_resources=true&include_prompts=true`,
+    );
+  },
+
+  /**
+   * Fetch tools, resources, and prompts from the MCP server after OAuth authorization
+   */
+  // prettier-ignore
+  fetchToolsAfterOAuth: ( // pragma: allowlist secret
+    id: string,
+  ): Promise<{ success: boolean; message: string }> => {
+    const validId = validateServerId(id);
+    return api.post(`/oauth/fetch-tools/${validId}`);
+  },
+
+  /**
+   * Open blank OAuth popup during an active user gesture.
+   *
+   * Catalog setup must register credentials before it knows the gateway ID. It
+   * opens this blank window first, then passes it to triggerOAuthAuthorization
+   * once registration returns. Keeping window.open synchronous prevents popup
+   * blockers from rejecting first-time setup.
+   */
+  openOAuthAuthorizationPopup,
+
+  /**
+   * Trigger OAuth authorization flow for a gateway via a popup window.
+   *
+   * Opens /oauth/authorize/{id}?popup=true&nonce=... in a centered popup. The
+   * backend encodes a "popup." prefix in the OAuth state so the callback page
+   * responds with window.opener.postMessage instead of rendering a full HTML
+   * page.
+   *
+   * The popup itself is a raw window.open() navigation, so it can't carry a
+   * CSRF header the way this client's other POSTs do — the nonce is the
+   * substitute (see server/src/lib/oauth-authorize-nonce.ts). Minting it is
+   * an async POST, so the popup window is opened blank *first*, synchronously
+   * within this click handler, and only navigated once the nonce comes back;
+   * doing the fetch before window.open() would lose the "opened from a user
+   * gesture" status popup blockers require.
+   *
+   * Returns a Promise that resolves on success or rejects on error / cancellation.
+   */
+  triggerOAuthAuthorization: (
+    id: string,
+    existingAuthWindow?: Window,
+  ): Promise<OAuthCallbackResult> => {
+    const validId = validateServerId(id);
+
+    return new Promise((resolve, reject) => {
+      const authWindow = existingAuthWindow ?? openOAuthAuthorizationPopup();
+      if (authWindow.closed) {
+        reject(new Error("OAuth authorization window was closed"));
+        return;
+      }
+
+      let settled = false;
+
+      const cleanup = () => {
+        window.removeEventListener("message", messageHandler);
+        clearInterval(pollInterval);
+      };
+
+      const messageHandler = (event: MessageEvent) => {
+        // Verify the message came from our specific popup rather than checking
+        // origin, which breaks when the React dev server (e.g. :3000) and the
+        // API server (e.g. :8000) run on different ports — the popup ends up on
+        // the API origin so event.origin !== window.location.origin.
+        if (event.source !== authWindow) return;
+        const data = event.data as OAuthCallbackResult;
+        if (!data || data.type !== "oauth_callback") return;
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (data.status === "success") {
+          resolve(data);
+        } else {
+          reject(new Error(data.errorDescription ?? data.error ?? "OAuth authorization failed"));
+        }
+      };
+
+      window.addEventListener("message", messageHandler);
+
+      // Detect when the user closes the popup without completing OAuth.
+      // 1 s is fast enough to feel responsive while not burning cycles.
+      const pollInterval = setInterval(() => {
+        if (authWindow.closed) {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(new OAuthCancelledError());
+          }
+        }
+      }, 1000);
+
+      api
+        // {} — not omitted — so this isn't a Content-Type: application/json
+        // POST with a truly empty body, which Fastify's default JSON parser
+        // rejects with FST_ERR_CTP_EMPTY_JSON_BODY before the route handler
+        // (or even sessionAuth) ever runs. Same reasoning as /auth/logout.
+        .post<{ nonce: string }>("/oauth/authorize-nonce", {})
+        .then(({ nonce }) => {
+          if (settled) return;
+          authWindow.location.href = `/oauth/authorize/${validId}?popup=true&nonce=${encodeURIComponent(nonce)}`;
+        })
+        .catch((err: unknown) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          authWindow.close();
+          reject(err instanceof Error ? err : new Error("Failed to start OAuth authorization"));
+        });
+    });
+  },
+};
+
+export interface OAuthCallbackResult {
+  type: "oauth_callback";
+  status: "success" | "error";
+  gatewayId?: string;
+  gatewayName?: string;
+  error?: string;
+  errorDescription?: string;
+}

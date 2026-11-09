@@ -1,0 +1,643 @@
+import { waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { serversApi } from "./servers";
+import { setCsrfToken } from "./client";
+import type { GatewayTestRequest, GatewayHandshakeRequest } from "@/generated/types";
+
+function nonceResponse(nonce = "test-nonce"): Response {
+  return new Response(JSON.stringify({ nonce }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function mockAuthPopup(): Window & { location: { href: string }; close: () => void } {
+  return { closed: false, location: { href: "" }, close: vi.fn() } as unknown as Window & {
+    location: { href: string };
+    close: () => void;
+  };
+}
+
+describe("serversApi", () => {
+  const mockFetch = vi.fn();
+
+  beforeEach(() => {
+    // Mock fetch globally
+    global.fetch = mockFetch;
+    vi.clearAllMocks();
+    setCsrfToken("test-csrf-token");
+  });
+
+  afterEach(() => {
+    setCsrfToken(null);
+    vi.restoreAllMocks();
+  });
+
+  describe("toggleEnabled", () => {
+    it("should activate a server with CSRF token", async () => {
+      const mockResponse = new Response(
+        JSON.stringify({ status: "success", message: "Server activated" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse);
+
+      const result = await serversApi.toggleEnabled("server-123", true);
+
+      expect(result).toEqual({ status: "success", message: "Server activated" });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/server-123/state?activate=true"),
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-Token": "test-csrf-token",
+          }),
+          credentials: "same-origin", // pragma: allowlist secret
+        }),
+      );
+    });
+
+    it("should deactivate a server with CSRF token", async () => {
+      const mockResponse = new Response(
+        JSON.stringify({ status: "success", message: "Server deactivated" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse);
+
+      const result = await serversApi.toggleEnabled("server-123", false);
+
+      expect(result).toEqual({ status: "success", message: "Server deactivated" });
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/server-123/state?activate=false"),
+        expect.anything(),
+      );
+    });
+
+    it("should throw error when response is not ok", async () => {
+      const mockResponse = new Response(JSON.stringify({ detail: "Internal server error" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+      mockFetch.mockResolvedValueOnce(mockResponse);
+
+      await expect(serversApi.toggleEnabled("server-123", true)).rejects.toThrow("HTTP 500");
+    });
+
+    it("should work without CSRF token", async () => {
+      Object.defineProperty(document, "cookie", {
+        writable: true,
+        value: "",
+      });
+
+      const mockResponse = new Response(
+        JSON.stringify({ status: "success", message: "Server activated" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse);
+
+      await serversApi.toggleEnabled("server-123", true);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/server-123/state?activate=true"),
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+          }),
+        }),
+      );
+    });
+  });
+
+  describe("fetchToolsAfterOAuth", () => {
+    it("makes a POST to /oauth/fetch-tools/{id} with CSRF header and returns success response", async () => {
+      const mockResponse = new Response(
+        JSON.stringify({ success: true, message: "Successfully fetched and created 43 tools" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse);
+
+      const result = await serversApi.fetchToolsAfterOAuth("server-abc");
+
+      expect(result).toEqual({
+        success: true,
+        message: "Successfully fetched and created 43 tools",
+      });
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/oauth/fetch-tools/server-abc"),
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "X-CSRF-Token": "test-csrf-token",
+          }),
+          credentials: "same-origin", // pragma: allowlist secret
+        }),
+      );
+    });
+
+    it("throws ApiError on non-2xx response", async () => {
+      const mockResponse = new Response(
+        JSON.stringify({ detail: "Gateway not found: server-xyz" }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse);
+
+      await expect(serversApi.fetchToolsAfterOAuth("server-xyz")).rejects.toThrow("HTTP 404");
+    });
+
+    it("throws synchronously on invalid server ID", () => {
+      expect(() => serversApi.fetchToolsAfterOAuth("../etc/passwd")).toThrow(
+        "Invalid server ID format",
+      );
+    });
+  });
+
+  describe("triggerOAuthAuthorization", () => {
+    it("rejects before requesting a nonce when supplied popup is already closed", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      (mockAuthWindow as { closed: boolean }).closed = true;
+
+      await expect(
+        serversApi.triggerOAuthAuthorization("server-123", mockAuthWindow),
+      ).rejects.toThrow("OAuth authorization window was closed");
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects when popup is blocked (window.open returns null)", async () => {
+      vi.spyOn(window, "open").mockReturnValue(null);
+
+      await expect(serversApi.triggerOAuthAuthorization("server-123")).rejects.toThrow(
+        "Failed to open OAuth authorization window",
+      );
+      // Blocked before ever needing a nonce.
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("opens a blank popup synchronously, then navigates it to the authorize URL once the nonce arrives", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse("minted-nonce"));
+
+      // Don't await — just trigger the call. window.open() must happen
+      // synchronously within this call (a user-gesture requirement popup
+      // blockers enforce), before the async nonce fetch below resolves.
+      serversApi.triggerOAuthAuthorization("server-abc");
+
+      expect(window.open).toHaveBeenCalledWith("", "oauth_authorization", expect.any(String));
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/oauth/authorize-nonce"),
+        expect.objectContaining({ method: "POST" }),
+      );
+
+      await waitFor(() => {
+        expect(mockAuthWindow.location.href).toContain(
+          "/oauth/authorize/server-abc?popup=true&nonce=minted-nonce",
+        );
+      });
+    });
+
+    it("closes the popup and rejects when minting the nonce fails", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      await expect(promise).rejects.toThrow();
+      expect(mockAuthWindow.close).toHaveBeenCalled();
+      // Never navigated -- the popup must not sit on a blank page silently.
+      expect(mockAuthWindow.location.href).toBe("");
+    });
+
+    it("resolves with success data when popup sends a success postMessage", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      const successData = {
+        type: "oauth_callback",
+        status: "success",
+        gatewayId: "server-123",
+        gatewayName: "Test Server",
+      };
+      const event = new MessageEvent("message", { data: successData });
+      Object.defineProperty(event, "source", { value: mockAuthWindow, writable: false });
+      window.dispatchEvent(event);
+
+      await expect(promise).resolves.toEqual(successData);
+    });
+
+    it("rejects with errorDescription when popup sends an error postMessage", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      const event = new MessageEvent("message", {
+        data: {
+          type: "oauth_callback",
+          status: "error",
+          error: "access_denied",
+          errorDescription: "User denied access",
+        },
+      });
+      Object.defineProperty(event, "source", { value: mockAuthWindow, writable: false });
+      window.dispatchEvent(event);
+
+      await expect(promise).rejects.toThrow("User denied access");
+    });
+
+    it("falls back to the error code when errorDescription is absent", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      const event = new MessageEvent("message", {
+        data: { type: "oauth_callback", status: "error", error: "server_error" },
+      });
+      Object.defineProperty(event, "source", { value: mockAuthWindow, writable: false });
+      window.dispatchEvent(event);
+
+      await expect(promise).rejects.toThrow("server_error");
+    });
+
+    it("falls back to generic message when neither errorDescription nor error is present", async () => {
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      const event = new MessageEvent("message", {
+        data: { type: "oauth_callback", status: "error" },
+      });
+      Object.defineProperty(event, "source", { value: mockAuthWindow, writable: false });
+      window.dispatchEvent(event);
+
+      await expect(promise).rejects.toThrow("OAuth authorization failed");
+    });
+
+    it("ignores postMessages from other sources", async () => {
+      vi.useFakeTimers();
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      // Message from a different source — should be ignored
+      const foreignEvent = new MessageEvent("message", {
+        data: { type: "oauth_callback", status: "success", gatewayId: "server-123" },
+      });
+      // source stays null (the default), which !== mockAuthWindow
+      window.dispatchEvent(foreignEvent);
+
+      // Simulate popup closing to settle the promise
+      (mockAuthWindow as { closed: boolean }).closed = true;
+      vi.advanceTimersByTime(1000);
+
+      await expect(promise).rejects.toThrow("OAuth authorization was cancelled");
+
+      vi.useRealTimers();
+    });
+
+    it("ignores non-oauth_callback messages from the popup", async () => {
+      vi.useFakeTimers();
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      // Correct source, but payloads that fail the null / type guard are ignored.
+      const nullEvent = new MessageEvent("message", { data: null });
+      Object.defineProperty(nullEvent, "source", { value: mockAuthWindow, writable: false });
+      window.dispatchEvent(nullEvent);
+
+      const wrongTypeEvent = new MessageEvent("message", { data: { type: "something_else" } });
+      Object.defineProperty(wrongTypeEvent, "source", { value: mockAuthWindow, writable: false });
+      window.dispatchEvent(wrongTypeEvent);
+
+      // Neither settled the promise; closing the popup does.
+      (mockAuthWindow as { closed: boolean }).closed = true;
+      vi.advanceTimersByTime(1000);
+
+      await expect(promise).rejects.toThrow("OAuth authorization was cancelled");
+
+      vi.useRealTimers();
+    });
+
+    it("rejects with cancellation message when user closes the popup", async () => {
+      vi.useFakeTimers();
+      const mockAuthWindow = mockAuthPopup();
+      vi.spyOn(window, "open").mockReturnValue(mockAuthWindow);
+      mockFetch.mockResolvedValueOnce(nonceResponse());
+
+      const promise = serversApi.triggerOAuthAuthorization("server-123");
+
+      (mockAuthWindow as { closed: boolean }).closed = true;
+      vi.advanceTimersByTime(1000);
+
+      await expect(promise).rejects.toThrow("OAuth authorization was cancelled");
+
+      vi.useRealTimers();
+    });
+  });
+
+  describe("updateTags", () => {
+    it("PUTs /v1/mcp-servers/:id with a tags-only body and returns the updated server", async () => {
+      const updated = { id: "server-123", tags: [{ id: "prod", label: "prod" }] };
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(updated), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const result = await serversApi.updateTags("server-123", ["prod"]);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/server-123"),
+        expect.objectContaining({
+          method: "PUT",
+          body: JSON.stringify({ tags: ["prod"] }),
+        }),
+      );
+      expect(result).toEqual(updated);
+    });
+
+    it("throws synchronously for an invalid server ID", () => {
+      expect(() => serversApi.updateTags("../etc/passwd", ["prod"])).toThrow(
+        "Invalid server ID format",
+      );
+    });
+  });
+
+  describe("validateServerId (via get)", () => {
+    it("throws 'Invalid server ID' for an empty id", () => {
+      expect(() => serversApi.get("")).toThrow(/^Invalid server ID$/);
+    });
+
+    it("throws 'Invalid server ID format' for an id with illegal characters", () => {
+      expect(() => serversApi.get("bad/id")).toThrow("Invalid server ID format");
+    });
+  });
+
+  describe("list", () => {
+    const jsonResponse = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    it("requests /v1/mcp-servers with only include_pagination by default", async () => {
+      const body = { servers: [], pagination: { nextCursor: null } };
+      mockFetch.mockResolvedValueOnce(jsonResponse(body));
+
+      const result = await serversApi.list();
+
+      expect(result).toEqual(body);
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain("/v1/mcp-servers?");
+      expect(url).toContain("include_pagination=true");
+      expect(url).not.toContain("cursor=");
+      expect(url).not.toContain("limit=");
+      expect(url).not.toContain("include_inactive=");
+    });
+
+    it("includes cursor, clamped limit, and include_inactive when provided", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ servers: [] }));
+
+      await serversApi.list({ cursor: "next-page", limit: 500, include_inactive: true });
+
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain("cursor=next-page");
+      expect(url).toContain("limit=100"); // clamped to the max of 100
+      expect(url).toContain("include_inactive=true");
+    });
+
+    it("clamps a limit below 1 up to 1", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ servers: [] }));
+
+      await serversApi.list({ limit: 0 });
+
+      expect(mockFetch.mock.calls[0][0]).toContain("limit=1");
+    });
+
+    it("falls back to a limit of 25 for a non-finite limit", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ servers: [] }));
+
+      await serversApi.list({ limit: Number.POSITIVE_INFINITY });
+
+      expect(mockFetch.mock.calls[0][0]).toContain("limit=25");
+    });
+
+    it("resolves when passed an AbortSignal", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ servers: [] }));
+      const controller = new AbortController();
+
+      await expect(serversApi.list({ signal: controller.signal })).resolves.toEqual({
+        servers: [],
+      });
+    });
+  });
+
+  describe("get", () => {
+    const jsonResponse = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    it("fetches /v1/mcp-servers/:id and returns the server", async () => {
+      const server = { id: "get-basic", name: "Basic" };
+      mockFetch.mockResolvedValueOnce(jsonResponse(server));
+
+      const result = await serversApi.get("get-basic");
+
+      expect(result).toEqual(server);
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/get-basic"),
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("returns the same in-flight promise for concurrent gets (request cache)", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ id: "get-cache" }));
+
+      const first = serversApi.get("get-cache");
+      const second = serversApi.get("get-cache");
+
+      expect(first).toBe(second);
+      await first;
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("evicts the cache on failure so a later call retries", async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "boom" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      await expect(serversApi.get("get-evict")).rejects.toThrow("HTTP 500");
+
+      // The failed request was removed from the cache, so this refetches.
+      mockFetch.mockResolvedValueOnce(jsonResponse({ id: "get-evict" }));
+      const result = await serversApi.get("get-evict");
+
+      expect(result).toEqual({ id: "get-evict" });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("testConnection", () => {
+    it("POSTs /v1/mcp-servers/:id/test and returns the result", async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ success: true, message: "Reachable" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const result = await serversApi.testConnection("server-123");
+
+      expect(result).toEqual({ success: true, message: "Reachable" });
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/server-123/test"),
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+
+    it("throws synchronously for an invalid server ID", () => {
+      expect(() => serversApi.testConnection("../etc/passwd")).toThrow("Invalid server ID format");
+    });
+  });
+
+  describe("refreshTools", () => {
+    it("POSTs to /gateways/:id/tools/refresh with include_resources=true&include_prompts=true", async () => {
+      const mockBody = {
+        gatewayId: "srv-1",
+        success: true,
+        toolsAdded: 2,
+        toolsUpdated: 0,
+        toolsRemoved: 1,
+        durationMs: 120,
+        refreshedAt: "2025-09-09T00:00:00Z",
+      };
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(mockBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const result = await serversApi.refreshTools("srv-1");
+
+      expect(result).toEqual(mockBody);
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain("/gateways/srv-1/tools/refresh");
+      expect(url).toContain("include_resources=true");
+      expect(url).toContain("include_prompts=true");
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+
+    it("throws synchronously for an invalid server ID", () => {
+      expect(() => serversApi.refreshTools("../etc/passwd")).toThrow("Invalid server ID format");
+    });
+
+    it("throws ApiError on 409 response", async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Refresh already running" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      await expect(serversApi.refreshTools("srv-1")).rejects.toThrow("HTTP 409");
+    });
+  });
+
+  describe("delete", () => {
+    it("DELETEs /v1/mcp-servers/:id", async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      await serversApi.delete("server-123");
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/server-123"),
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+
+    it("throws synchronously for an invalid server ID", () => {
+      expect(() => serversApi.delete("../etc/passwd")).toThrow("Invalid server ID format");
+    });
+  });
+
+  describe("testConnectivity", () => {
+    it("POSTs the request to /v1/mcp-servers/test and returns the response", async () => {
+      const upstream = { statusCode: 200, body: "ok" };
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(upstream), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const request: GatewayTestRequest = {
+        method: "GET",
+        baseUrl: "https://example.com",
+        path: "/health",
+      };
+      const result = await serversApi.testConnectivity(request);
+
+      expect(result).toEqual(upstream);
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/test"),
+        expect.objectContaining({ method: "POST", body: JSON.stringify(request) }),
+      );
+    });
+  });
+
+  describe("testHandshake", () => {
+    it("POSTs the request to /v1/mcp-servers/test-handshake, forwards the signal, and returns the response", async () => {
+      const upstream = { success: true, latencyMs: 12, credentialSource: "none" };
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(upstream), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const request: GatewayHandshakeRequest = { baseUrl: "https://example.com" };
+      const controller = new AbortController();
+      const result = await serversApi.testHandshake(request, controller.signal);
+
+      expect(result).toEqual(upstream);
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/mcp-servers/test-handshake"),
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify(request),
+          signal: controller.signal,
+        }),
+      );
+    });
+  });
+});
