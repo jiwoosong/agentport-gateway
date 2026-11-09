@@ -27,7 +27,8 @@ AgentPort의 중심은 독립 게이트웨이입니다. 대시보드는 서비�
 | 단일 기동, 사용 중 보호, 유휴 중지, 실패 시 배포 복구 | 동시성·모의 Komodo 계약 테스트; 실제 장치 검증은 별도 |
 | Codex·Claude ACP | 실제 초기 연결 확인, 모의 ACP 프로세스로 세션·재개 검증; 유료 추론 미검증 |
 | React Flow 대시보드, 기존 로그인 BFF | 빌드·회귀 테스트; 상세 결과는 검증 문서 |
-| Docker Compose, PostgreSQL, 원격 PC·DGX GPU | 배포 구성 제공; 검증한 환경만 검증 문서에 기록 |
+| Docker Compose, PostgreSQL, Redis | Ubuntu amd64 CI에서 실제 빌드·로그인·DBOS 변환·BFF 세션·결과 조회 통과 |
+| 원격 PC·DGX GPU, HTTPS profile | 배포 구성 제공; 실장비·원격 연결 미검증 |
 | Paperclip·RAG·OpenAI 호환 API·HTTP/MCP 도구 | 선언형 연결 계약. 해당 제공자별 전체 기능 검증을 의미하지 않음 |
 | Hermes·OpenClaw·Kimi, 메신저 | 전용 어댑터 미구현. HTTP/MCP로 이미 노출된 기능은 일반 서비스로 연결 가능 |
 

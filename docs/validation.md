@@ -18,9 +18,12 @@
 | 빌드 | TypeScript·Vite UI, Fastify BFF 빌드 통과 |
 | npm 감사 | UI·BFF·ACP 워커 잠금 파일에서 알려진 취약점 **0건**. 감사 시점의 DB 기준이며 무취약성 보장이 아님 |
 | Compose 정적 검증 | 공식 Compose 5.7.0으로 demo·managed·https profile의 config 검증 통과. Docker 데몬 실행 검증과는 별개 |
+| 실제 Docker Compose | GitHub Actions Ubuntu amd64에서 demo 이미지 빌드·PostgreSQL 18·Redis 8 기동, 실제 로그인·DBOS 변환, BFF 로그인·세션·완료 결과 조회 통과. Paperclip 없이 실행. [실행 기록](https://github.com/jiwoosong/agentport-gateway/actions/runs/42542531228) |
 | 브라우저 | 실제 Chromium에서 로그인→텍스트 파일 업로드→비동기 실행→CSV 다운로드, 독립 모바일 세션 로그인→같은 작업 조회, 390 px 폭 가로 넘침 없음 |
 
 모의 Komodo 테스트는 Docker의 실제 컨테이너 생성·중지·이미지 복구를 검증한 것이 아닙니다. 외부 HTTP stand-in은 클라우드 공급자나 법률 자료 처리의 정확성을 검증하지 않습니다. 실제 ACP 초기 연결도 모델 응답·프로젝트 코딩의 성공을 의미하지 않습니다.
+
+첫 Compose CI에서 내부 전용 네트워크에만 연결된 대시보드의 호스트 포트가 게시되지 않는 문제가 발견됐습니다. 웹 진입점에 일반 `frontend` 브리지를 추가한 뒤 실제 호스트 접속과 BFF 경로가 통과했습니다. HTTPS profile의 인증서·원격 모바일 접속과 Komodo 수명주기는 이 demo CI의 검증 범위가 아닙니다.
 
 ## 화면과 자원 측정
 
