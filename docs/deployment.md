@@ -12,6 +12,8 @@ docker compose ps
 
 관리자 이메일·비밀번호는 생성된 `.env`에서 로컬로 확인합니다. 웹은 `http://localhost:3000/app/orchestration`, 직접 REST/MCP는 loopback 4444입니다. 관리자 초기 비밀번호를 변경합니다. 기존 ContextForge 사용자·팀 화면에서 사용자를 만들고 프로젝트 팀과 역할을 부여합니다. AgentPort 서비스의 `project_id`는 그 팀 ID입니다.
 
+대시보드와 HTTPS 프록시는 호스트 포트 게시를 위해 `frontend` 일반 브리지에도 연결합니다. 이 두 구성요소에는 외부 통신 경로가 생깁니다. PostgreSQL·Redis·예제 변환기는 내부 전용 네트워크에 남습니다. Docker는 내부 전용 네트워크에만 연결한 컨테이너의 포트를 게시하지 않으므로, 웹 진입점까지 `internal`로 바꾸면 호스트 접속이 실패합니다. [Docker의 설명](https://github.com/moby/moby/discussions/53256)
+
 운영 데이터는 Compose 볼륨에 남습니다. `docker compose down`은 컨테이너를 내리고, **`down -v`는 데이터 볼륨을 삭제**하므로 운영 환경에서 쓰지 않습니다. 최초 DB 비밀번호를 바꿀 때 `.env`만 수정하면 기존 PostgreSQL/Mongo 계정 비밀번호가 자동으로 바뀌지는 않습니다.
 
 소스 개발은 README의 uv·npm 명령을 사용합니다. 생성된 `.env`의 SQLite 파일들은 `data/`에 있습니다. 기존 SQLite를 PostgreSQL로 자동 이전하는 도구는 제공하지 않습니다. 개발 데이터를 내보내고 새 운영 환경에 정의를 재등록하거나 검증한 별도 마이그레이션을 수행하세요. 암호화 키를 잃으면 저장된 자격 증명을 복원할 수 없습니다.

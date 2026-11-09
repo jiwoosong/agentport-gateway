@@ -46,7 +46,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
     ports: ["127.0.0.1:3000:3000"]
-    networks: [private]
+    networks: [private, frontend]
     depends_on: [gateway, redis]
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
@@ -92,11 +92,12 @@ services:
     environment: {AGENTPORT_HOST: "${AGENTPORT_HOST:-localhost}"}
     ports: ["${AGENTPORT_BIND:-127.0.0.1}:443:443"]
     volumes: ["./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "caddy:/data"]
-    networks: [private]
+    networks: [private, frontend]
     depends_on: [gateway, dashboard]
 networks:
   private: {internal: true}
   operations: {internal: true}
+  frontend: {}
   outbound: {}
 volumes:
   postgres: {}
