@@ -85,7 +85,7 @@ docker build -f deploy/worker.Dockerfile -t agentport-acp:0.1.0 .
 | `AOG_WORKER_PROJECT` | 서비스 프로젝트 ID; 개인 서비스는 빈 문자열 |
 | `AOG_WORKER_AUDIENCE` | 중앙에 등록한 정확한 호출 URL |
 | `AOG_WORKER_PUBLIC_KEY` | 중앙 Ed25519 공개 키, base64 |
-| `AOG_AGENT_PROVIDER` | codex 또는 claude |
+| `AOG_AGENT_PROVIDER` | codex, claude, hermes (별도 런타임 설치 필요) |
 | `AOG_WORKER_ROOT` | 전용 볼륨 내부 데이터/작업 경로 |
 | `AOG_WORKER_EGRESS` | 실제 네트워크 정책과 일치하는 unrestricted 또는 isolated |
 | `AOG_AGENT_APPROVAL_POLICY` | 기본은 모든 네이티브 승인 거부; container는 격리 경계 내 allow_once 허용 |
@@ -111,3 +111,7 @@ docker build -f deploy/worker.Dockerfile -t agentport-acp:0.1.0 .
 6. 검증 후 운영 트래픽을 전환합니다. 이미지 rollback과 DB restore는 별도 작업입니다. 단순 이미지 복구로 이미 적용된 스키마 변경이 취소되지는 않습니다.
 
 현재 PostgreSQL 실제 복원·DGX 배포·상태 저장 서비스의 데이터 마이그레이션 rollback은 이 환경에서 검증하지 않았습니다. 운영 도입 전 독립 복원 리허설이 필요합니다.
+
+Hermes·NemoClaw·Paperclip 연결 범위와 설정은 [호환성 가이드](integrations.md)를 참고하세요. 기본 ACP 이미지에는 Hermes/NemoClaw가 포함되지 않습니다.
+
+[OpenShell·Relay 실행 플랫폼 개편](runtime-platform.md)에서 새 실행 백엔드, 설치·이전 절차, 보안 경계와 검증 범위를 확인하세요.

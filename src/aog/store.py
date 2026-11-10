@@ -1,5 +1,6 @@
 """Extension-owned tables. ContextForge tables are never written here."""
 
+import hashlib
 import time
 import uuid
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from aog.models import Principal
@@ -77,6 +79,12 @@ class Lease(Base):
     run_id: Mapped[str] = mapped_column(String(64), index=True)
 
 
+class SandboxBinding(Base):
+    __tablename__ = "aog_sandbox_bindings"
+    target: Mapped[str] = mapped_column(String(64), primary_key=True)
+    service_id: Mapped[str] = mapped_column(ForeignKey("aog_resources.id"), unique=True)
+
+
 class Audit(Base):
     __tablename__ = "aog_audit"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
@@ -106,7 +114,9 @@ class Store:
                 db.execute(
                     text("ALTER TABLE aog_runs ADD COLUMN cancel_requested BOOLEAN NOT NULL DEFAULT FALSE")
                 )
-                db.execute(text("UPDATE aog_runs SET cancel_requested = TRUE WHERE status = 'cancel_requested'"))
+                db.execute(
+                    text("UPDATE aog_runs SET cancel_requested = TRUE WHERE status = 'cancel_requested'")
+                )
 
     @contextmanager
     def tx(self):
@@ -152,6 +162,9 @@ class Store:
                     raise HTTPException(409, "Service has active leases")
                 if state.phase in {"starting", "stopping", "updating"} and not deployment:
                     raise HTTPException(409, "Service has an active deployment operation")
+                old_target = db.get(Resource, rid).document.get("openshell")
+                if old_target != document.get("openshell") and state.phase != "stopped":
+                    raise HTTPException(409, "Stop and reconcile the runtime before changing sandbox binding")
             row = db.get(Resource, rid) if rid else None
             if row:
                 row.document = document
@@ -170,6 +183,24 @@ class Store:
                 db.flush()
                 if kind == "service":
                     db.add(Runtime(service_id=row.id))
+            if kind == "service":
+                binding = db.scalar(select(SandboxBinding).where(SandboxBinding.service_id == row.id))
+                if binding:
+                    db.delete(binding)
+                    db.flush()
+                target = document.get("openshell")
+                if target:
+                    # Unique DB constraint prevents two service lease pools for one sandbox.
+                    identity = "\0".join(target[k] for k in ("gateway", "workspace", "sandbox"))
+                    db.add(
+                        SandboxBinding(
+                            target=hashlib.sha256(identity.encode()).hexdigest(), service_id=row.id
+                        )
+                    )
+                    try:
+                        db.flush()
+                    except IntegrityError:
+                        raise HTTPException(409, "Sandbox is already bound to another service") from None
             db.add(Audit(actor=actor.subject, action=f"{kind}.save", resource_id=row.id))
             db.flush()
             return row

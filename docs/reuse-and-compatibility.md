@@ -33,7 +33,7 @@ Python·npm 의존성의 실제 설치 버전과 무결성은 `uv.lock`, `dashbo
 
 Codex·Claude의 초기 ACP 연결에서 protocol 1과 `loadSession` 지원을 확인했습니다. 네이티브 세션 생성·재개 호출은 SDK와 모의 ACP 프로세스로 검증했습니다. 실제 계정으로 수행하는 코딩·검수, 모델 선택 및 provider 도구 권한의 모든 조합은 미검증입니다. 분기(fork)는 제공하지 않습니다. 지원 여부는 어댑터의 협상 결과로 판단하며 불가능하면 실패합니다.
 
-`openai`와 `paperclip` transport는 선언한 JSON HTTP 엔드포인트를 호출합니다. 공급자별 의미 변환이나 포괄적인 SDK 지원을 뜻하지 않습니다. 다른 인증 헤더·스트리밍·웹훅 프로토콜이 필요한 API는 ContextForge 또는 별도 HTTP/MCP 어댑터로 연결합니다. Hermes/OpenClaw/Kimi 전용 하네스 연결은 아직 없습니다.
+`openai`와 `paperclip` transport는 선언한 JSON HTTP 엔드포인트를 호출합니다. 공급자별 의미 변환이나 포괄적인 SDK 지원을 뜻하지 않습니다. 다른 인증 헤더·스트리밍·웹훅 프로토콜이 필요한 API는 ContextForge 또는 별도 HTTP/MCP 어댑터로 연결합니다. Hermes ACP 실행 프로필은 추가했으며 모의 프로토콜 테스트까지 검증했습니다. 실제 Hermes 런타임·NemoClaw·OpenClaw·Kimi의 종단 간 연결은 미검증입니다. [제품별 호환성 가이드](integrations.md)에 연결 방식과 제한을 기록합니다.
 
 RAG 검색은 서비스 계약이며 원본 문서 ACL 검증은 RAG 구현의 책임입니다. 공유 스킬 게시도 별도 서비스의 명시적 동작입니다. 중앙은 임의로 대화를 스킬로 만들거나 벡터 저장소에 게시하지 않습니다.
 
@@ -46,3 +46,9 @@ RAG 검색은 서비스 계약이며 원본 문서 ACL 검증은 RAG 구현의 �
 5. 검증 기록을 수정하고 새 버전을 발행합니다. 보안 수정 외의 무계획 자동 업데이트는 하지 않습니다.
 
 참고: [DBOS 통합](https://docs.dbos.dev/python/integrating-dbos), [Komodo Compose](https://komo.do/docs/deploy/compose), [Komodo 원격 서버 연결](https://komo.do/docs/setup/connect-servers).
+
+## 실행 플랫폼 추가
+
+- OpenShell Python SDK 0.1.7 (Apache-2.0): 선택 의존성, `uv.lock` 고정. 시작·중지·조회와 상태 대기에 사용. 호스트 런타임 자동 설치 없음.
+- NeMo Relay (Apache-2.0): Hermes 네이티브 연결의 TOML/ATOF 계약 재사용. 소스 조사 기준 `dc00b939ae916266ce4f22ca080c9f13a40d4c48`. 중앙 SDK 의존성 없음.
+- [실행 플랫폼 가이드](runtime-platform.md)에 검증 상태와 미지원 기능을 기록합니다.

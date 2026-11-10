@@ -41,4 +41,40 @@ describe("AgentPort", () => {
       expect.objectContaining({ local_only: true, nodes: [expect.objectContaining({ type: "join",
         inputs: { public: { $ref: "input.public" } } })] })));
   });
+  it("offers OpenShell lifecycle controls without a Komodo update action", async () => {
+    vi.mocked(api.get).mockImplementation(async path => {
+      if (path.endsWith("/services")) return [{ ...service, openshell: { gateway: 'pc', workspace: 'team', sandbox: 'alice', sandbox_id: 's1' } }];
+      if (path.endsWith("/me")) return { is_admin: true };
+      if (path.endsWith("/runtime")) return { phase: 'SANDBOX_PHASE_READY', policy_version: 7 };
+      return [];
+    });
+    render(<Orchestration />);
+    fireEvent.click(await screen.findByRole("button", { name: "Check sandbox" }));
+    expect(await screen.findByText('READY · policy 7')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'update' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'start' }));
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith('/orchestration/v1/services/convert/operations/start', {}));
+  });
+
+  it("shows Relay observations separately from job completion", async () => {
+    const run = { id: 'run-1', name: 'Hermes task', status: 'completed', steps: [{
+      id: 'agent', status: 'completed', output: { value: { observability: {
+        source: 'nemo-relay', available: true, counts: { llm: { started: 2, ended: 1 } }, truncated: true,
+      } } },
+    }] };
+    vi.mocked(api.get).mockImplementation(async path => {
+      if (path.endsWith('/runs')) return [run];
+      if (path.endsWith('/runs/run-1')) return run;
+      if (path.endsWith('/me')) return { is_admin: false };
+      return [];
+    });
+    render(<Orchestration />);
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    fireEvent.click(await screen.findByRole('button', { name: /Hermes task/ }));
+    expect(await screen.findByText('NeMo Relay activity')).toBeInTheDocument();
+    expect(screen.getByText('llm: 2 started / 1 ended')).toBeInTheDocument();
+    expect(screen.getByText(/Counts do not confirm task success/)).toBeInTheDocument();
+    expect(screen.getByText(/Partial record window/)).toBeInTheDocument();
+  });
+
 });
