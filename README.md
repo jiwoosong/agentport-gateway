@@ -42,13 +42,8 @@ docker compose --profile demo up -d --build
 - [Integrations](docs/integrations.md) — 에이전트와 외부 서비스 연결
 - [Architecture](docs/architecture.md) — 구성요소와 실행 방식
 - [API Reference](docs/contracts.md) — REST·MCP와 서비스·워크플로우 정의
+- [Security](docs/security.md) — 접근 권한, 네트워크, 데이터 보호 설정
 - [Documentation Index](docs/README.md) — 운영, 개발, 호환성 문서
-
-## Project Status
-
-초기 개발 단계입니다. 웹·MCP 사용 경로와 파일 변환 예제를 검증했으며, 실제 GPU 장치와 외부 에이전트의 통합 검증은 진행이 필요합니다. 메신저 연동은 후속 범위입니다. 지원 범위는 [Compatibility](docs/README.md#지원-및-검증-현황), 실행 결과는 [Validation](docs/validation.md)을 참조하세요.
-
-외부 접속과 민감한 데이터 처리에 필요한 설정은 [Security](docs/security.md)에 정리되어 있습니다.
 
 ## Contributing
 
