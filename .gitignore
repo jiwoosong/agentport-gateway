@@ -22,3 +22,6 @@ playwright-report/
 logs/
 *.log
 *.tsbuildinfo
+
+# Operator control-plane certificates and registry (never publish)
+openshell-secrets/

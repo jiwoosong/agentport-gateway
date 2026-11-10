@@ -319,25 +319,23 @@ async def operation(
     require_admin(actor)
     row = current().store.resource(rid, actor, "service")
     service = Service.model_validate(row.document)
-    if not service.stack_id:
+    if not (service.stack_id or service.openshell):
         raise HTTPException(409, "Service has no managed deployment")
+    if service.openshell and operation == "update":
+        raise HTTPException(409, "Provision and verify a replacement OpenShell sandbox before rebinding")
     if not current().store.claim_stop(rid, 0, phase="updating"):
         raise HTTPException(409, "Service is busy; wait for active jobs to drain")
     current().store.audit(actor.subject, f"service.{operation}", rid)
     try:
-        backend = current().lifecycle.backend
-        if operation == "stop":
-            await backend.stop(service.stack_id)
-        elif operation == "start":
-            await backend.start(service.stack_id)
-        else:
-            await backend.update(service.stack_id)
+        await current().lifecycle.control(service, operation)
         if operation != "stop" and service.health_url:
             await current().lifecycle.health(service.health_url, service.timeout_seconds)
         current().store.phase(rid, "stopped" if operation == "stop" else "running")
     except Exception:
         current().store.phase(rid, "error")
-        raise HTTPException(502, "Deployment needs operator attention; inspect Komodo") from None
+        raise HTTPException(
+            502, "Deployment needs operator attention; inspect the configured runtime backend"
+        ) from None
     return {"phase": current().store.phase(rid)}
 
 
@@ -357,8 +355,16 @@ class RuntimeResolution(BaseModel):
 async def reconcile_runtime(rid: str, resolution: RuntimeResolution, actor: Principal = Depends(operator)):
     require_admin(actor)
     row = current().store.resource(rid, actor, "service")
+    service = Service.model_validate(row.document)
+    if service.openshell:
+        try:
+            remote = await current().lifecycle.control(service, "status")
+        except Exception:
+            raise HTTPException(502, "Cannot verify OpenShell sandbox") from None
+        expected = "SANDBOX_PHASE_READY" if resolution.phase == "running" else "SANDBOX_PHASE_STOPPED"
+        if remote["phase"] != expected:
+            raise HTTPException(409, "OpenShell state does not match the reconciliation")
     if resolution.phase == "running":
-        service = Service.model_validate(row.document)
         if not service.health_url:
             raise HTTPException(422, "A readiness URL is required to reconcile a running service")
         await current().lifecycle.health(service.health_url, service.timeout_seconds)
@@ -369,3 +375,16 @@ async def reconcile_runtime(rid: str, resolution: RuntimeResolution, actor: Prin
         db.get(Runtime, rid).phase = resolution.phase
     current().store.audit(actor.subject, "service.reconcile", rid, resolution.model_dump())
     return {"phase": resolution.phase}
+
+
+@router.get("/services/{rid}/runtime")
+async def runtime_detail(rid: str, actor: Principal = Depends(reader)):
+    require_admin(actor)
+    row = current().store.resource(rid, actor, "service")
+    service = Service.model_validate(row.document)
+    if not service.openshell:
+        return {"backend": "komodo" if service.stack_id else "external", "phase": current().store.phase(rid)}
+    try:
+        return await current().lifecycle.control(service, "status")
+    except Exception:
+        raise HTTPException(502, "OpenShell status unavailable or sandbox identity changed") from None

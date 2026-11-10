@@ -11,6 +11,8 @@ AgentPort는 ContextForge 1.1.0의 FastAPI 애플리케이션에 `/orchestration
 | DBOS | 실행 체크포인트, 대기, 자식 워크플로우, 재시작 복구 | 외부 부작용의 exactly-once 보장 |
 | SQLAlchemy 저장소 | 정의·리비전, 비공개 실행, 단계·임대·감사 기록 | 원본 ContextForge 테이블 변경 |
 | Komodo | 운영자 등록 스택의 시작·중지·배포 | 일반 사용자에게 Docker 제어권 부여 |
+| OpenShell (선택) | 샌드박스 시작·중지·상태, 실행 경계의 정책 적용 | 중앙 사용자 계정·프로젝트 그래프 대체 |
+| NeMo Relay (선택) | Hermes 내부 활동을 로컬 기록, 중앙에는 제한된 요약 | 실행 성공 판정, DBOS 체크포인트·복구 대체 |
 | ACP 워커 | 사용자·프로젝트 경계 안에서 기존 하네스 실행, 세션·파일 전달 | 자체 LLM 추론 루프 구현 |
 | React 대시보드·BFF | 기존 HttpOnly 세션·CSRF, 서비스 폼·그래프·작업 결과 | 브라우저에 API JWT 저장 |
 | 선택 서비스 | RAG, Paperclip, 이미지·영상·DB, 메신저 | 중앙 계정의 대체 |
@@ -68,3 +70,5 @@ HTTP 호출의 exactly-once는 보장할 수 없습니다. 게이트웨이와 AC
 독립 정의는 `models.py`와 `graph.py`, 네트워크 연결은 `adapters.py`, 배포 정책은 `lifecycle.py`에 있습니다. ContextForge 교체 시 주된 교체 지점은 `security.py`, `app.py`, 기존 UI/BFF입니다. DBOS 교체 시 실행·대기·체크포인트 부분을 바꿔야 합니다. 교체 비용이 없는 무의존성을 주장하지 않습니다.
 
 Paperclip은 일반 HTTP/MCP 서비스로 연결합니다. 중지해도 로그인·다른 도구·자체 그래프는 작동합니다. 기존 ContextForge 도구 등록 기능과 AgentPort의 관리 서비스 등록은 별도입니다. 수명주기/릴리스 정책이 필요한 서비스를 원본 프록시에 중복 노출하면 정책을 우회할 수 있으므로 운영자가 금지해야 합니다.
+
+[OpenShell·Relay 실행 플랫폼 개편](runtime-platform.md)에서 새 실행 백엔드, 설치·이전 절차, 보안 경계와 검증 범위를 확인하세요.

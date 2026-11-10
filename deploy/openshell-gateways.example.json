@@ -1,0 +1,8 @@
+{
+  "pc": {
+    "endpoint": "openshell.internal:8443",
+    "ca_path": "/run/agentport-openshell/ca.crt",
+    "cert_path": "/run/agentport-openshell/operator.crt",
+    "key_path": "/run/agentport-openshell/operator.key"
+  }
+}

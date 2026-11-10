@@ -5,7 +5,8 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 COPY examples ./examples
-RUN uv sync --frozen --no-dev && useradd --uid 10001 --create-home gateway \
+ARG AOG_RUNTIME_EXTRA=""
+RUN uv sync --frozen --no-dev ${AOG_RUNTIME_EXTRA:+--extra "$AOG_RUNTIME_EXTRA"} && useradd --uid 10001 --create-home gateway \
     && mkdir /app/data && chown gateway:gateway /app/data
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 USER gateway

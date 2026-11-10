@@ -13,6 +13,14 @@ class Lifecycle:
         self.store = store
         self.backend = backend or adapters.Komodo()
         self.health = health or adapters.ready
+        from aog.openshell import OpenShell
+
+        self.openshell = OpenShell()
+
+    async def control(self, service: Service, operation: str):
+        if service.openshell:
+            return await self.openshell.execute(service.openshell, operation, service.timeout_seconds)
+        return await getattr(self.backend, operation)(service.stack_id)
 
     async def acquire(self, service_id: str, service: Service, key: str, run_id: str):
         deadline = time.monotonic() + service.timeout_seconds
@@ -24,7 +32,7 @@ class Lifecycle:
             return
         if self.store.claim_start(service_id):
             try:
-                await self.backend.start(service.stack_id)
+                await self.control(service, "start")
                 await self.health(service.health_url, service.timeout_seconds)
                 self.store.phase(service_id, "running")
             except Exception:
@@ -44,14 +52,14 @@ class Lifecycle:
             if service.lifecycle == "always_on" and service.enabled:
                 if self.store.claim_start(row.id):
                     try:
-                        await self.backend.start(service.stack_id)
+                        await self.control(service, "start")
                         await self.health(service.health_url, service.timeout_seconds)
                         self.store.phase(row.id, "running")
                     except Exception:
                         self.store.phase(row.id, "error")
             elif service.lifecycle == "on_demand" and self.store.claim_stop(row.id, service.idle_seconds):
                 try:
-                    await self.backend.stop(service.stack_id)
+                    await self.control(service, "stop")
                     self.store.phase(row.id, "stopped")
                 except Exception:
                     self.store.phase(row.id, "error")
@@ -60,6 +68,8 @@ class Lifecycle:
         from fastapi import HTTPException
 
         service = Service.model_validate(row.document)
+        if service.openshell:
+            raise HTTPException(409, "OpenShell updates require a separately provisioned replacement sandbox")
         target = service.releases.get(release)
         if not target or not service.stack_id or not service.health_url:
             raise HTTPException(422, "Register a release stack and readiness URL first")
@@ -67,7 +77,7 @@ class Lifecycle:
             raise HTTPException(409, "Active jobs must drain before deployment")
         self.store.audit(actor.subject, "release.begin", row.id, {"release": release})
         try:
-            await self.backend.stop(service.stack_id)
+            await self.control(service, "stop")
             await self.backend.update(target)
             await self.health(service.health_url, service.timeout_seconds)
             self.store.save(
@@ -85,7 +95,7 @@ class Lifecycle:
                 try:
                     # A failed deployment might still be running: confirm it stopped first.
                     await self.backend.stop(target)
-                    await self.backend.start(service.stack_id)
+                    await self.control(service, "start")
                     await self.health(service.health_url, service.timeout_seconds)
                     self.store.phase(row.id, "running")
                     self.store.audit(actor.subject, "release.rolled_back", row.id, {"release": release})

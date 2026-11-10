@@ -1,0 +1,15 @@
+# Use with: docker compose -f compose.yaml -f deploy/compose.openshell.yaml up -d --build
+# Does not install a gateway, start a sandbox, or expose host Docker credentials.
+services:
+  gateway:
+    build:
+      context: .
+      args:
+        AOG_RUNTIME_EXTRA: openshell
+    environment:
+      AOG_OPENSHELL_CONFIG: /run/agentport-openshell/gateways.json
+    volumes:
+      - type: bind
+        source: ${AOG_OPENSHELL_CONFIG_DIR:?Set an absolute operator-managed config directory}
+        target: /run/agentport-openshell
+        read_only: true

@@ -21,6 +21,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from aog.identity import verification_key
+from aog.observability import configure_relay, relay_cursor, relay_summary
 
 app = FastAPI(title="AgentPort ACP worker")
 root = Path(os.environ.get("AOG_WORKER_ROOT", "data/worker"))
@@ -118,6 +119,8 @@ def health():
         "fork": False,
         "owner_bound": bool(os.environ.get("AOG_WORKER_OWNER")),
         "egress_policy": os.environ.get("AOG_WORKER_EGRESS", "unrestricted"),
+        "provider": os.environ.get("AOG_AGENT_PROVIDER", "codex"),
+        "relay_configured": os.environ.get("AOG_RELAY_ENABLED") == "1",
     }
 
 
@@ -159,9 +162,21 @@ async def invoke(
             )
         ]
     provider = os.environ.get("AOG_AGENT_PROVIDER", "codex")
-    commands = {"codex": "codex-acp", "claude": "claude-agent-acp"}
+    commands = {"codex": "codex-acp", "claude": "claude-agent-acp", "hermes": "hermes-acp"}
     if provider not in commands:
         raise HTTPException(503, "Unsupported ACP worker template")
+    relay_enabled = os.environ.get("AOG_RELAY_ENABLED") == "1"
+    if relay_enabled and provider != "hermes":
+        raise HTTPException(422, "Relay worker integration currently requires Hermes native support")
+    if provider == "hermes":
+        # Hermes owns provider selection and credentials in its dedicated profile.
+        # A generic Bearer token must not silently become an Anthropic/OpenAI key.
+        if authorization:
+            raise HTTPException(422, "Configure Hermes credentials in its dedicated HERMES_HOME")
+        # Hermes binds resumed sessions to the original MCP credential fingerprint.
+        # AgentPort rotates delegation tokens; do not pretend this can reattach safely.
+        if value.native_session_id and value.allowed_service_ids:
+            raise HTTPException(409, "Hermes resume with delegated MCP tools is not supported yet")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     database = root / "jobs.sqlite"
     with sqlite3.connect(database) as db:
@@ -186,9 +201,17 @@ async def invoke(
     env.update(
         {"HOME": str(home.resolve()), "CODEX_HOME": str((home / ".codex").resolve()), "NO_BROWSER": "1"}
     )
+    if provider == "hermes":
+        hermes_home = home / ".hermes"
+        hermes_home.mkdir(exist_ok=True, mode=0o700)
+        env["HERMES_HOME"] = str(hermes_home.resolve())
     if authorization and authorization.startswith("Bearer "):
         env["OPENAI_API_KEY" if provider == "codex" else "ANTHROPIC_API_KEY"] = authorization[7:]
     client = Client()
+    if relay_enabled:
+        config, relay_file = configure_relay(root)
+        env["HERMES_NEMO_RELAY_PLUGINS_TOML"] = str(config)
+        cursor = relay_cursor(relay_file)
     async with asyncio.timeout(int(os.environ.get("AOG_AGENT_TIMEOUT", "900"))):
         async with spawn_agent_process(client, commands[provider], cwd=workspace.resolve(), env=env) as (
             conn,
@@ -209,6 +232,8 @@ async def invoke(
                 native_id = session.session_id
             if value.model:
                 await conn.set_config_option(session_id=native_id, config_id="model", value=value.model)
+            # ACP load_session may replay previous messages. Return only this turn.
+            client.chunks.clear()
             text = (value.persona + "\n\n" if value.persona else "") + json.dumps(
                 value.prompt, ensure_ascii=False
             )
@@ -228,6 +253,8 @@ async def invoke(
             except ValueError:
                 pass
     output["files"] = export_files(workspace, value.export_paths)
+    if relay_enabled:
+        output["observability"] = relay_summary(relay_file, cursor)
     with sqlite3.connect(database) as db:
         db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(output), idempotency_key))
     return output

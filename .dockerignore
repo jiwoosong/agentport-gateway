@@ -9,3 +9,5 @@ data
 **/.pytest_cache
 dashboard/server/public
 dashboard/server/dist
+
+openshell-secrets

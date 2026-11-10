@@ -11,7 +11,7 @@ import { Textarea } from "../components/ui/textarea";
 type Json = Record<string, unknown>;
 type Entity = { id: string; name: string; kind: string; owner: string; revision: number;
   input_schema?: { properties?: Record<string, { type?: string; title?: string; enum?: string[] }>; required?: string[] };
-  runtime_phase?: string; lifecycle?: string; nodes?: StepDef[]; local_only?: boolean; [key: string]: unknown };
+  runtime_phase?: string; lifecycle?: string; openshell?: { gateway: string; workspace: string; sandbox: string; sandbox_id: string }; nodes?: StepDef[]; local_only?: boolean; [key: string]: unknown };
 type StepDef = { id: string; type: string; target?: string; depends_on: string[]; inputs: Json;
   position: { x: number; y: number }; session_id?: string; reviewer?: string; release?: boolean; max_rounds?: number; when?: Json };
 type Run = { id: string; name: string; status: string; result?: Json;
@@ -118,14 +118,17 @@ export function Orchestration() {
         <div className="flex justify-between gap-2"><h3 className="font-semibold">{s.name}</h3>
           <span className="rounded bg-muted px-2 py-1 text-xs">{s.kind}</span></div>
         <p className="mt-3 text-sm text-muted-foreground">{admin ? (s.lifecycle === "manual" ? "Managed externally" : `${s.lifecycle?.replace(/_/g, " ")} · ${s.runtime_phase}`) : "Send a request and receive a result"}</p>
+        {s.openshell && <p className="mt-2 text-xs text-muted-foreground">OpenShell sandbox</p>}
+        {admin && s.openshell && <RuntimeStatus service={s} />}
         <div className="mt-5 flex flex-wrap gap-2"><Button onClick={() => setSelected(s)}>Use service</Button>
           {admin && <Button size="sm" variant="outline" onClick={() => void action(async () => {
             const value = await api.get<{ definition: Json }>(`${base}/services/${s.id}/export`);
             setRegistration(serialize(value.definition)); setEditingService(s.id); setRegister(true);
           }, "Editing service definition")}>Configure</Button>}
-          {admin && s.stack_id ? ["start", "stop", "update"].map(op => <Button key={op} size="sm" variant="outline" disabled={busy}
+          {admin && (s.stack_id || s.openshell) ? (s.openshell ? ["start", "stop"] : ["start", "stop", "update"]).map(op => <Button key={op} size="sm" variant="outline" disabled={busy}
             onClick={() => void action(() => api.post(`${base}/services/${s.id}/operations/${op}`, {}), `Deployment ${op} completed`)}>{op}</Button>) : null}
           <Button size="sm" variant="ghost" onClick={() => void action(async () => download(`${s.name}.json`, await api.get(`${base}/services/${s.id}/export`)), "Exported")}>Export</Button></div>
+        {admin && s.openshell && ['error', 'starting', 'stopping', 'updating'].includes(s.runtime_phase || '') && <RuntimeReconcile service={s} busy={busy} action={action} />}
         {admin && s.stack_id ? <div className="mt-3 space-y-2">
           <label className="block text-xs">Deploy registered release<select className={selectClass} value="" disabled={busy}
             onChange={e => { if (e.target.value) void action(() => api.post(`${base}/services/${s.id}/releases/${encodeURIComponent(e.target.value)}/deploy`, {}), "Release operation completed; check current runtime"); }}>
@@ -200,6 +203,7 @@ export function Orchestration() {
           onClick={() => void action(() => api.post(`${base}/runs/${selectedRun.id}/cancel`, {}), "Cancellation requested")}>Request cancellation</Button>}
         {selectedRun.steps?.map(s => <section key={s.id} className="rounded-lg border p-4">
           <div className="flex justify-between"><strong>{s.id}</strong><span className="text-sm">{s.status.replace(/_/g, " ")}</span></div>
+          <RelayActivity output={s.output.value} />
           <details open={s.status === "waiting_approval"} className="my-3"><summary className="cursor-pointer text-xs text-muted-foreground">{s.status === "waiting_approval" ? "Payload to approve" : "Step details"}</summary>
             <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">{serialize(s.output)}</pre></details>
           {s.status === "waiting_approval" && <div className="space-y-2"><p className="text-sm">Review the exact payload above before approving{Boolean(s.output.release) ? " its release to a cloud step" : ""}.</p>
@@ -311,7 +315,7 @@ function GraphEditor({ initial, services, agents, onSave, onClose }: { initial: 
 type Action = (work: () => Promise<unknown>, message?: string) => Promise<void>;
 function RuntimeReconcile({ service, busy, action }: { service: Entity; busy: boolean; action: Action }) {
   const [verified, setVerified] = useState(false);
-  return <div className="space-y-2"><label className="flex gap-2 text-xs"><input type="checkbox" checked={verified} onChange={e => setVerified(e.target.checked)} />I verified the deployment state in Komodo</label>
+  return <div className="space-y-2"><label className="flex gap-2 text-xs"><input type="checkbox" checked={verified} onChange={e => setVerified(e.target.checked)} />I verified the deployment state in its runtime backend</label>
     {['running', 'stopped'].map(phase => <Button key={phase} size="sm" variant="outline" disabled={!verified || busy} onClick={() => void action(() => api.post(`${base}/services/${service.id}/reconcile`, { phase, deployment_verified: true }), "Runtime reconciled")}>Confirm {phase}</Button>)}</div>;
 }
 
@@ -323,4 +327,35 @@ function StepReconcile({ run, step, busy, action }: { run: string; step: string;
     {['completed', 'failed'].map(outcome => <Button key={outcome} size="sm" variant="outline" disabled={!verified || busy} onClick={() => void action(() => api.post(`${base}/runs/${run}/steps/${step}/resolve`, {
       outcome, output: JSON.parse(output), external_execution_stopped: true,
     }), "Execution reconciled")}>Confirm {outcome}</Button>)}</div>;
+}
+
+function RuntimeStatus({ service }: { service: Entity }) {
+  const [status, setStatus] = useState("");
+  const [pending, setPending] = useState(false);
+  return <div className="mt-2 space-y-2">
+    <Button size="sm" variant="ghost" disabled={pending} onClick={async () => {
+      setPending(true);
+      try {
+        const value = await api.get<{ phase: string; policy_version: number }>(`${base}/services/${service.id}/runtime`);
+        setStatus(`${value.phase.replace('SANDBOX_PHASE_', '')} · policy ${value.policy_version}`);
+      } catch (error) { setStatus(errorText(error)); }
+      finally { setPending(false); }
+    }}>Check sandbox</Button>
+    {status && <p role="status" className="text-xs">{status}</p>}
+  </div>;
+}
+
+function RelayActivity({ output }: { output: unknown }) {
+  const value = (output as { observability?: { source?: string; available?: boolean;
+    counts?: Record<string, { started: number; ended: number }>; truncated?: boolean; rotated?: boolean } } | null)?.observability;
+  if (value?.source !== 'nemo-relay') return null;
+  return <div className="my-3 rounded border p-3 text-sm">
+    <strong>NeMo Relay activity</strong>
+    {!value.available ? <p>No local Relay records available.</p> : <>
+      <p className="text-xs text-muted-foreground">Worker observation window. Counts do not confirm task success.</p>
+      <div className="mt-2 flex flex-wrap gap-3">{['agent', 'turn', 'tool', 'llm'].map(category =>
+        <span key={category}>{category}: {Number(value.counts?.[category]?.started || 0)} started / {Number(value.counts?.[category]?.ended || 0)} ended</span>)}</div>
+      {(value.truncated || value.rotated) && <p>Partial record window; inspect the worker locally.</p>}
+    </>}
+  </div>;
 }

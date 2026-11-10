@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "kind": "paperclip",
+  "transport": "paperclip",
+  "lifecycle": "manual",
+  "location": "local",
+  "egress_policy": "unrestricted",
+  "visibility": "private",
+  "credential_ref": "REPLACE_CREDENTIAL_RESOURCE_ID",
+  "idempotent": false,
+  "name": "Paperclip issues create",
+  "endpoint": "http://paperclip:3100/api/companies/REPLACE_COMPANY_ID/issues",
+  "http_method": "POST",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "title"
+    ],
+    "additionalProperties": false
+  },
+  "output_schema": {}
+}

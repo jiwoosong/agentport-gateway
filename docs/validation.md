@@ -73,3 +73,12 @@ node scripts/browser-smoke.mjs
 ```
 
 모든 실제 HTTP/브라우저 테스트에는 로컬 소켓 접근이 필요합니다. 제한된 실행 샌드박스에서 소켓이 금지되어 있으면 일반 개발 환경에서 실행하세요. 테스트는 임시 DB·계정·포트를 사용하고 자신이 시작한 프로세스만 종료합니다. `.github/workflows/ci.yml`이 공개 저장소에서도 검증을 반복합니다.
+
+## 2026-11-10 실행 플랫폼 개편
+
+- OpenShell SDK 0.1.7 선택 의존성 설치와 잠금 검증. 실제 SDK·protobuf를 사용하는 로컬 모의 gRPC 서버로 조회·시작·중지·상태 대기 검증.
+- 전체 테스트: `AOG_INTEGRATION=1 AOG_OPENSHELL_WIRE=1 pytest -q` → **28 passed, 17.56초**. 새 binding 중복·ID 변경·불명확 mutation·활성 작업 보호·Relay 원문 제외 및 기존 로그인/MCP/두 사용자 격리/프로세스 강제 종료 복구 포함.
+- 대시보드 프로덕션 빌드 통과. AgentPort 화면 테스트 4개 통과 (일반 사용자·그래프·OpenShell 제어·Relay 요약). 기존 vendor chunk/annotation 빌드 경고는 남아 있음.
+- Ruff 및 diff 공백 검사 통과. OpenShell Compose override 구문 검증 통과. 실제 Docker 이미지 빌드는 이 로컬 환경에서 수행하지 않음.
+- 제한 환경에서 thread/DBOS 테스트가 멈추던 문제는 일반 로컬 실행으로 재검증하여 통과 확인. 제품 로직 실패로 재현되지 않음.
+- 미검증: 실제 OpenShell Gateway mTLS/샌드박스/네트워크 정책, Hermes 모델+Relay 이벤트 생성, DGX/GPU, native 취소 및 AgentPort 단절 시 외부 호출 차단. 모의 프로토콜 통과를 이 항목의 지원 보장으로 사용하지 않음.

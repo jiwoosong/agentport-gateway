@@ -373,6 +373,25 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
         ).json()
         assert other.get(f"/orchestration/v1/artifacts/{artifact['id']}").status_code == 404
         assert other.post("/orchestration/v1/services", json=definition).status_code == 403
+        # New runtime APIs must retain the existing admin boundary.
+        sandbox_definition = json.loads((ROOT / "examples/openshell-agent.service.json").read_text())
+        sandbox_response = client.post("/orchestration/v1/services", json=sandbox_definition)
+        assert sandbox_response.status_code == 201, sandbox_response.text
+        sandbox_id = sandbox_response.json()["id"]
+        assert client.post("/orchestration/v1/services", json=sandbox_definition).status_code == 409
+        assert client.post(f"/orchestration/v1/services/{sandbox_id}/operations/update").status_code == 409
+        assert other.get(f"/orchestration/v1/services/{sandbox_id}/runtime").status_code == 403
+        assert other.post(f"/orchestration/v1/services/{sandbox_id}/operations/start").status_code == 403
+        assert (
+            other.post(
+                f"/orchestration/v1/services/{sandbox_id}/reconcile",
+                json={
+                    "phase": "running",
+                    "deployment_verified": True,
+                },
+            ).status_code
+            == 403
+        )
 
         # Exercise the actual SDK MCP handshake and tool call, not a JSON-RPC mock.
         async def mcp_check():

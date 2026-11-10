@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "Hermes in OpenShell",
+  "kind": "agent",
+  "transport": "acp",
+  "endpoint": "https://worker.internal/invoke",
+  "health_url": "https://worker.internal/health",
+  "lifecycle": "manual",
+  "openshell": {
+    "gateway": "pc",
+    "workspace": "alice-project",
+    "sandbox": "hermes-alice",
+    "sandbox_id": "REPLACE_VERIFIED_SANDBOX_ID"
+  },
+  "concurrency": 1,
+  "timeout_seconds": 900,
+  "location": "local",
+  "egress_policy": "unrestricted",
+  "visibility": "private",
+  "input_schema": {"type": "object"}
+}

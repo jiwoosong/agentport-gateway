@@ -14,7 +14,7 @@ AgentPort의 중심은 독립 게이트웨이입니다. 대시보드는 서비�
 - **에이전트 작업:** 런타임·모델·페르소나·허용 도구·도구 호출 한도를 설정하고 새 세션 또는 기존 세션을 선택합니다.
 - **작성과 검수:** 그래프에서 작성자와 검수자를 지정하고 선택한 파일의 스냅샷을 전달합니다. 수정 반복은 기본 최대 3회이며, 클라우드 요청마다 승인을 요구하도록 설정할 수 있습니다.
 - **민감 데이터 처리:** 로컬 서비스가 선택한 출력만 승인 노드로 전달하고, 승인한 정확한 입력만 외부 단계에 보냅니다. 자동 익명화 모델 자체는 포함하지 않습니다.
-- **서비스 운영:** 상시 실행·요청 시 실행·수동 실행을 구분하고, 사용 중 종료·업데이트를 막습니다. Komodo가 실제 Docker 작업을 수행합니다.
+- **서비스 운영:** 상시 실행·요청 시 실행·수동 실행을 구분하고, 사용 중 종료·업데이트를 막습니다. 일반 Docker 서비스는 Komodo, 선택적 샌드박스는 OpenShell SDK로 제어합니다.
 
 ## 구현 및 검증 상태
 
@@ -30,7 +30,9 @@ AgentPort의 중심은 독립 게이트웨이입니다. 대시보드는 서비�
 | Docker Compose, PostgreSQL, Redis | Ubuntu amd64 CI에서 실제 빌드·로그인·DBOS 변환·BFF 세션·결과 조회 통과 |
 | 원격 PC·DGX GPU, HTTPS profile | 배포 구성 제공; 실장비·원격 연결 미검증 |
 | Paperclip·RAG·OpenAI 호환 API·HTTP/MCP 도구 | 선언형 연결 계약. 해당 제공자별 전체 기능 검증을 의미하지 않음 |
-| Hermes·OpenClaw·Kimi, 메신저 | 전용 어댑터 미구현. HTTP/MCP로 이미 노출된 기능은 일반 서비스로 연결 가능 |
+| Hermes ACP·NeMo Relay | 실행 프로필·로컬 활동 요약·모의 ACP/ATOF 검증. 실제 Hermes 추론 미검증 |
+| OpenShell 0.1.7 | 선택적 시작·중지·상태 SDK backend 및 UI. 실제 SDK/모의 gRPC 검증, 실샌드박스 미검증 |
+| NemoClaw·OpenClaw·Kimi, 메신저 | 전용 운영 어댑터 미구현. 기존 서비스 계약으로 확장 |
 
 [검증 기록](docs/validation.md)에서 실제 실행한 항목과 미검증 항목을 구분합니다. 보안 감사 완료나 인터넷 공개형 다중 고객 격리를 주장하지 않습니다.
 
@@ -109,6 +111,7 @@ ContextForge의 인증·권한·프록시를 재사용하고 자체 테이블·�
 
 - [아키텍처·복구·권한](docs/architecture.md)
 - [재사용 범위·버전·라이선스](docs/reuse-and-compatibility.md)
+- [Hermes·NemoClaw·Paperclip 연결 범위](docs/integrations.md)
 - [설치·HTTPS·PC/DGX·업데이트·백업](docs/deployment.md)
 - [서비스·그래프·MCP 계약](docs/contracts.md)
 - [검증 기록과 제한](docs/validation.md)
@@ -120,3 +123,5 @@ AOG_INTEGRATION=1 uv run pytest tests/test_http_integration.py -q
 cd dashboard
 npm test -- --maxWorkers=2
 ```
+
+[OpenShell·Relay 실행 플랫폼 개편](docs/runtime-platform.md)에서 새 실행 백엔드, 설치·이전 절차, 보안 경계와 검증 범위를 확인하세요.

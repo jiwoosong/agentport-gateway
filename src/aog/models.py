@@ -19,6 +19,14 @@ class Definition(BaseModel):
         return self
 
 
+class OpenShellTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gateway: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    workspace: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    sandbox: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    sandbox_id: str = Field(min_length=1, max_length=128)
+
+
 class Service(Definition):
     enabled: bool = True
     kind: Literal["tool", "model", "agent", "paperclip"] = "tool"
@@ -31,6 +39,7 @@ class Service(Definition):
     output_schema: dict = Field(default_factory=dict)
     lifecycle: Literal["always_on", "on_demand", "manual"] = "manual"
     stack_id: str | None = None
+    openshell: OpenShellTarget | None = None
     releases: dict[str, str] = Field(default_factory=dict)  # Operator-registered immutable Komodo stacks.
     current_release: str | None = None
     rollback_safe: bool = False  # Only stateless or explicitly backward-compatible deployments.
@@ -70,8 +79,10 @@ class Service(Definition):
 
     @model_validator(mode="after")
     def runtime(self):
-        if self.lifecycle != "manual" and (not self.stack_id or not self.health_url):
-            raise ValueError("Managed services require stack_id and health_url")
+        if self.openshell and (self.stack_id or self.releases or self.current_release or self.rollback_safe):
+            raise ValueError("OpenShell and Komodo deployment settings cannot be combined")
+        if self.lifecycle != "manual" and (not (self.stack_id or self.openshell) or not self.health_url):
+            raise ValueError("Managed services require a deployment target and health_url")
         if self.transport == "mcp" and not self.tool_name:
             raise ValueError("MCP services require tool_name")
         if self.kind == "agent" and self.transport != "acp":

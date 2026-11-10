@@ -12,6 +12,24 @@ for line in sys.stdin:
         result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}, "authMethods": []}
     elif method == "session/new":
         result = {"sessionId": "native-fixture"}
+    elif method == "session/load":
+        print(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": params["sessionId"],
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "previous conversation"},
+                        },
+                    },
+                }
+            ),
+            flush=True,
+        )
+        result = {}
     elif method == "session/prompt":
         print(
             json.dumps(

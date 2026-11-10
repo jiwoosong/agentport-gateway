@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "kind": "paperclip",
+  "transport": "paperclip",
+  "lifecycle": "manual",
+  "location": "local",
+  "egress_policy": "unrestricted",
+  "visibility": "private",
+  "credential_ref": "REPLACE_CREDENTIAL_RESOURCE_ID",
+  "idempotent": true,
+  "name": "Paperclip issues list",
+  "endpoint": "http://paperclip:3100/api/companies/REPLACE_COMPANY_ID/issues",
+  "http_method": "GET",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  },
+  "output_schema": {}
+}
