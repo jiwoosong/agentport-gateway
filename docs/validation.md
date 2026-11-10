@@ -82,3 +82,10 @@ node scripts/browser-smoke.mjs
 - Ruff 및 diff 공백 검사 통과. OpenShell Compose override 구문 검증 통과. 실제 Docker 이미지 빌드는 이 로컬 환경에서 수행하지 않음.
 - 제한 환경에서 thread/DBOS 테스트가 멈추던 문제는 일반 로컬 실행으로 재검증하여 통과 확인. 제품 로직 실패로 재현되지 않음.
 - 미검증: 실제 OpenShell Gateway mTLS/샌드박스/네트워크 정책, Hermes 모델+Relay 이벤트 생성, DGX/GPU, native 취소 및 AgentPort 단절 시 외부 호출 차단. 모의 프로토콜 통과를 이 항목의 지원 보장으로 사용하지 않음.
+
+## 2026-11-10 문서 정리와 리팩터링
+
+- 기존 테스트 수정 없이 `AOG_INTEGRATION=1 AOG_OPENSHELL_WIRE=1 pytest -q`: **28 passed, 17.80초**.
+- AgentPort UI 테스트 4개와 프로덕션 빌드 통과. 변경한 UI 파일 ESLint(경고 없음)·Prettier, Python Ruff 및 문서 내부 파일 링크 검사 통과.
+- DB 스키마, API 계약, DBOS 단계 순서는 변경하지 않았습니다. 실제 장비 지원 범위를 확대하는 변경이 아닙니다.
+- [코드 검토 기록](code-review.md)에 범위와 구조 변경을 설명합니다.

@@ -124,16 +124,10 @@ def health():
     }
 
 
-@app.post("/invoke")
-async def invoke(
-    value: Prompt,
-    x_aog_context: str = Header(),
-    idempotency_key: str = Header(),
-    authorization: str | None = Header(default=None),
-):
+def verify_invocation(value: Prompt, context: str, key: str):
     try:
         actor = jwt.decode(
-            x_aog_context,
+            context,
             verification_key(),
             algorithms=["EdDSA"],
             issuer="agentport-worker",
@@ -145,22 +139,28 @@ async def invoke(
         raise HTTPException(403, "Worker belongs to another user")
     if (actor.get("project_id") or "") != os.environ.get("AOG_WORKER_PROJECT", ""):
         raise HTTPException(403, "Worker belongs to another project")
-    if actor.get("run_step") != idempotency_key:
+    if actor.get("run_step") != key:
         raise HTTPException(403, "Delegation is bound to another invocation")
     if value.local_only and os.environ.get("AOG_WORKER_EGRESS") != "isolated":
         raise HTTPException(403, "Worker network is not isolated")
-    mcp_servers = []
-    if value.allowed_service_ids:
-        if not value.gateway_mcp_url or not value.gateway_token:
-            raise HTTPException(422, "Scoped gateway delegation is required")
-        mcp_servers = [
-            HttpMcpServer(
-                type="http",
-                name="agentport",
-                url=value.gateway_mcp_url,
-                headers=[HttpHeader(name="Authorization", value="Bearer " + value.gateway_token)],
-            )
-        ]
+
+
+def delegated_mcp_servers(value: Prompt):
+    if not value.allowed_service_ids:
+        return []
+    if not value.gateway_mcp_url or not value.gateway_token:
+        raise HTTPException(422, "Scoped gateway delegation is required")
+    return [
+        HttpMcpServer(
+            type="http",
+            name="agentport",
+            url=value.gateway_mcp_url,
+            headers=[HttpHeader(name="Authorization", value="Bearer " + value.gateway_token)],
+        )
+    ]
+
+
+def select_provider(value: Prompt, authorization: str | None):
     provider = os.environ.get("AOG_AGENT_PROVIDER", "codex")
     commands = {"codex": "codex-acp", "claude": "claude-agent-acp", "hermes": "hermes-acp"}
     if provider not in commands:
@@ -177,25 +177,10 @@ async def invoke(
         # AgentPort rotates delegation tokens; do not pretend this can reattach safely.
         if value.native_session_id and value.allowed_service_ids:
             raise HTTPException(409, "Hermes resume with delegated MCP tools is not supported yet")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    database = root / "jobs.sqlite"
-    with sqlite3.connect(database) as db:
-        db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, request TEXT, result TEXT)")
-        checksum = hashlib.sha256(value.model_dump_json().encode()).hexdigest()
-        old = db.execute("SELECT request, result FROM jobs WHERE id=?", (idempotency_key,)).fetchone()
-        if old:
-            if old[0] != checksum:
-                raise HTTPException(409, "Idempotency key input mismatch")
-            if old[1] is not None:
-                return json.loads(old[1])
-            raise HTTPException(409, "Prior execution needs reconciliation; not replayed")
-        db.execute("INSERT INTO jobs VALUES (?, ?, NULL)", (idempotency_key, checksum))
-    workspace = root / "workspaces" / value.session_key
-    home = root / "home"
-    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-    home.mkdir(exist_ok=True, mode=0o700)
-    (home / ".codex").mkdir(exist_ok=True, mode=0o700)
-    import_files(workspace, value.workspace_files)
+    return commands[provider], provider, relay_enabled
+
+
+def agent_environment(home: Path, provider: str, authorization: str | None):
     # Do not inherit gateway/worker signing keys or operator credentials into agents.
     env = {k: os.environ[k] for k in ("PATH", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR") if k in os.environ}
     env.update(
@@ -207,13 +192,13 @@ async def invoke(
         env["HERMES_HOME"] = str(hermes_home.resolve())
     if authorization and authorization.startswith("Bearer "):
         env["OPENAI_API_KEY" if provider == "codex" else "ANTHROPIC_API_KEY"] = authorization[7:]
+    return env
+
+
+async def run_agent(value: Prompt, command: str, workspace: Path, env: dict, mcp_servers: list):
     client = Client()
-    if relay_enabled:
-        config, relay_file = configure_relay(root)
-        env["HERMES_NEMO_RELAY_PLUGINS_TOML"] = str(config)
-        cursor = relay_cursor(relay_file)
     async with asyncio.timeout(int(os.environ.get("AOG_AGENT_TIMEOUT", "900"))):
-        async with spawn_agent_process(client, commands[provider], cwd=workspace.resolve(), env=env) as (
+        async with spawn_agent_process(client, command, cwd=workspace.resolve(), env=env) as (
             conn,
             process,
         ):
@@ -252,6 +237,44 @@ async def invoke(
                     output["structured"] = structured
             except ValueError:
                 pass
+    return output
+
+
+@app.post("/invoke")
+async def invoke(
+    value: Prompt,
+    x_aog_context: str = Header(),
+    idempotency_key: str = Header(),
+    authorization: str | None = Header(default=None),
+):
+    verify_invocation(value, x_aog_context, idempotency_key)
+    mcp_servers = delegated_mcp_servers(value)
+    command, provider, relay_enabled = select_provider(value, authorization)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    database = root / "jobs.sqlite"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, request TEXT, result TEXT)")
+        checksum = hashlib.sha256(value.model_dump_json().encode()).hexdigest()
+        old = db.execute("SELECT request, result FROM jobs WHERE id=?", (idempotency_key,)).fetchone()
+        if old:
+            if old[0] != checksum:
+                raise HTTPException(409, "Idempotency key input mismatch")
+            if old[1] is not None:
+                return json.loads(old[1])
+            raise HTTPException(409, "Prior execution needs reconciliation; not replayed")
+        db.execute("INSERT INTO jobs VALUES (?, ?, NULL)", (idempotency_key, checksum))
+    workspace = root / "workspaces" / value.session_key
+    home = root / "home"
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.mkdir(exist_ok=True, mode=0o700)
+    (home / ".codex").mkdir(exist_ok=True, mode=0o700)
+    import_files(workspace, value.workspace_files)
+    env = agent_environment(home, provider, authorization)
+    if relay_enabled:
+        config, relay_file = configure_relay(root)
+        env["HERMES_NEMO_RELAY_PLUGINS_TOML"] = str(config)
+        cursor = relay_cursor(relay_file)
+    output = await run_agent(value, command, workspace, env, mcp_servers)
     output["files"] = export_files(workspace, value.export_paths)
     if relay_enabled:
         output["observability"] = relay_summary(relay_file, cursor)

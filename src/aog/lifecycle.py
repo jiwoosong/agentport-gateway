@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from aog import adapters
 from aog.models import Service
+from aog.openshell import OpenShell
 from aog.store import Resource, Store
 
 
@@ -13,14 +14,18 @@ class Lifecycle:
         self.store = store
         self.backend = backend or adapters.Komodo()
         self.health = health or adapters.ready
-        from aog.openshell import OpenShell
-
         self.openshell = OpenShell()
 
     async def control(self, service: Service, operation: str):
         if service.openshell:
             return await self.openshell.execute(service.openshell, operation, service.timeout_seconds)
         return await getattr(self.backend, operation)(service.stack_id)
+
+    async def _start_claimed(self, service_id: str, service: Service):
+        """Complete a startup after the caller has acquired the database claim."""
+        await self.control(service, "start")
+        await self.health(service.health_url, service.timeout_seconds)
+        self.store.phase(service_id, "running")
 
     async def acquire(self, service_id: str, service: Service, key: str, run_id: str):
         deadline = time.monotonic() + service.timeout_seconds
@@ -32,9 +37,7 @@ class Lifecycle:
             return
         if self.store.claim_start(service_id):
             try:
-                await self.control(service, "start")
-                await self.health(service.health_url, service.timeout_seconds)
-                self.store.phase(service_id, "running")
+                await self._start_claimed(service_id, service)
             except Exception:
                 # A start command with an unknown outcome requires operator reconciliation.
                 self.store.phase(service_id, "error")
@@ -52,9 +55,7 @@ class Lifecycle:
             if service.lifecycle == "always_on" and service.enabled:
                 if self.store.claim_start(row.id):
                     try:
-                        await self.control(service, "start")
-                        await self.health(service.health_url, service.timeout_seconds)
-                        self.store.phase(row.id, "running")
+                        await self._start_claimed(row.id, service)
                     except Exception:
                         self.store.phase(row.id, "error")
             elif service.lifecycle == "on_demand" and self.store.claim_stop(row.id, service.idle_seconds):
