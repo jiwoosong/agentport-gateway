@@ -14,6 +14,7 @@
 - [API·서비스·워크플로우 계약](contracts.md): REST, MCP, JSON/YAML 정의
 - [보안 경계](security.md): 데이터 접근, 외부 통신, 운영 책임
 - [재사용과 호환성](reuse-and-compatibility.md): 기술 스택, 버전, 라이선스
+- [유사 프로젝트와 경쟁력](competitive-landscape.md): 기능 비교, 차별화 후보, 개발 우선순위
 - [코드 검토·리팩터링 기록](code-review.md)
 - [검증 기록](validation.md): 테스트 결과와 남은 제약
 - [기여 안내](../CONTRIBUTING.md)
