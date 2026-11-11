@@ -11,3 +11,6 @@ dashboard/server/public
 dashboard/server/dist
 
 openshell-secrets
+upstream
+.venv-integration
+.venv-core

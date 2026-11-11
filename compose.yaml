@@ -19,27 +19,81 @@ services:
     volumes: ["redis:/data"]
     networks: [private]
   gateway:
-    build: .
-    image: agentport-gateway:0.1.0
-    env_file: .env
+    build: {context: ., dockerfile: deploy/contextforge.Dockerfile}
+    image: agentport-contextforge:1.1.0-1
     environment:
       DATABASE_URL: postgresql+psycopg://agentport:${POSTGRES_PASSWORD}@postgres/agentport
       AOG_DATABASE_URL: postgresql+psycopg://agentport:${POSTGRES_PASSWORD}@postgres/agentport
-      DBOS_SYSTEM_DATABASE_URL: postgresql://agentport:${POSTGRES_PASSWORD}@postgres/agentport
-      AOG_INTERNAL_MCP_URL: http://gateway:4444/orchestration/v1/mcp/
+      AOG_CORE_URL: http://core:4455
+      AOG_INTERNAL_GATEWAY_URL: ${AOG_INTERNAL_GATEWAY_URL:-http://gateway:4444}
+      AOG_GATEWAY_BRIDGE_SECRET: ${AOG_GATEWAY_BRIDGE_SECRET:?Run scripts/init-compose.py}
+      PLATFORM_ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL:-admin@example.com}
+      PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD:?Run scripts/init-compose.py}
+      DEFAULT_USER_PASSWORD: ${DEFAULT_USER_PASSWORD:?Run scripts/init-compose.py}
+      PASSWORD_CHANGE_ENFORCEMENT_ENABLED: ${PASSWORD_CHANGE_ENFORCEMENT_ENABLED:-true}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:?Run scripts/init-compose.py}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Run scripts/init-compose.py}
+      AUTH_ENCRYPTION_SECRET: ${AUTH_ENCRYPTION_SECRET:?Run scripts/init-compose.py}
+      AUTH_REQUIRED: "true"
+      MCP_CLIENT_AUTH_ENABLED: "true"
+      EMAIL_AUTH_ENABLED: "true"
+      MCPGATEWAY_UI_ENABLED: "true"
+      MCPGATEWAY_ADMIN_API_ENABLED: "true"
+      MCPGATEWAY_DIRECT_PROXY_ENABLED: "false"
+      SSRF_ALLOW_PRIVATE_NETWORKS: "false"
+      SSRF_ALLOWED_NETWORKS: '${SSRF_ALLOWED_NETWORKS:-["172.30.71.0/24"]}'
+      VALIDATION_MAX_RPC_PARAM_SIZE: "33554432"
+      MCPGATEWAY_A2A_ENABLED: "false"
+      LLM_API_ENABLED: "false"
       REDIS_URL: redis://redis:6379/0
       CACHE_TYPE: redis
+      LOG_LEVEL: ${LOG_LEVEL:-ERROR}
     depends_on:
       postgres: {condition: service_healthy}
+      redis: {condition: service_started}
     volumes: ["gateway-data:/app/data"]
     ports: ["127.0.0.1:4444:4444"]
     networks: [private, outbound]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4444/health', timeout=5)"]
+      interval: 5s
+      timeout: 6s
+      retries: 30
+      start_period: 15s
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+  core:
+    build: .
+    image: agentport-core:0.2.0
+    environment:
+      AOG_DATABASE_URL: postgresql+psycopg://agentport:${POSTGRES_PASSWORD}@postgres/agentport
+      DBOS_SYSTEM_DATABASE_URL: postgresql://agentport:${POSTGRES_PASSWORD}@postgres/agentport
+      AOG_GATEWAY_BACKEND: contextforge
+      AOG_GATEWAY_URL: http://gateway:4444
+      AOG_GATEWAY_BRIDGE_SECRET: ${AOG_GATEWAY_BRIDGE_SECRET:?Run scripts/init-compose.py}
+      KOMODO_URL: ${KOMODO_URL:-http://komodo:9120}
+      KOMODO_API_KEY: ${KOMODO_API_KEY:-}
+      KOMODO_API_SECRET: ${KOMODO_API_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-ERROR}
+    depends_on:
+      gateway: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    volumes: ["gateway-data:/app/data"]
+    ports: ["127.0.0.1:4455:4455"]
+    networks: [private, outbound]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4455/health', timeout=5)"]
+      interval: 5s
+      timeout: 6s
+      retries: 30
+      start_period: 10s
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
   dashboard:
     build: {context: ., dockerfile: deploy/dashboard.Dockerfile}
     environment:
       CONTEXTFORGE_URL: http://gateway:4444
+      AGENTPORT_CORE_URL: http://core:4455
       REDIS_URL: redis://redis:6379/1
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3000}
@@ -47,18 +101,32 @@ services:
       PORT: 3000
     ports: ["127.0.0.1:3000:3000"]
     networks: [private, frontend]
-    depends_on: [gateway, redis]
+    depends_on:
+      core: {condition: service_healthy}
+      gateway: {condition: service_healthy}
+      redis: {condition: service_started}
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
   converter:
     profiles: [demo]
-    image: agentport-gateway:0.1.0
+    image: agentport-core:0.2.0
     command: ["uvicorn", "examples.converter:app", "--host", "0.0.0.0", "--port", "8080"]
     networks: [private]
     read_only: true
     tmpfs: ["/tmp"]
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
+  image-converter:
+    profiles: [image-demo]
+    build: {context: ., dockerfile: deploy/image-service.Dockerfile}
+    image: agentport-image-converter:0.1.0
+    networks: [private]
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 1g
+    cpus: 2
   komodo-db:
     profiles: [managed]
     image: mongo:8
@@ -93,9 +161,12 @@ services:
     ports: ["${AGENTPORT_BIND:-127.0.0.1}:443:443"]
     volumes: ["./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "caddy:/data"]
     networks: [private, frontend]
-    depends_on: [gateway, dashboard]
+    depends_on: [gateway, core, dashboard]
 networks:
-  private: {internal: true}
+  private:
+    internal: true
+    ipam:
+      config: [{subnet: "${AGENTPORT_PRIVATE_SUBNET:-172.30.71.0/24}"}]
   operations: {internal: true}
   frontend: {}
   outbound: {}

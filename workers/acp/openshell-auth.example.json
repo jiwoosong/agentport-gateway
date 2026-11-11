@@ -1,0 +1,13 @@
+{
+  "dgx": {
+    "endpoint": "dgx.private.example:443",
+    "ca_path": "/run/openshell/ca.crt",
+    "client_credentials": {
+      "issuer": "https://idp.private.example/realms/openshell",
+      "client_id": "agentport-runtime-operator",
+      "client_secret_env": "AOG_OPENSHELL_DGX_CLIENT_SECRET",
+      "audience": "openshell-gateway",
+      "scopes": ["sandbox:read", "sandbox:write"]
+    }
+  }
+}

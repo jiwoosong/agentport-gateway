@@ -78,6 +78,8 @@ def relay_summary(path: Path, cursor):
             invalid += 1
     return {
         "source": "nemo-relay",
+        "mode": "observe",
+        "enforcement": False,
         "available": True,
         "scope": "worker_window",
         "counts": counts,

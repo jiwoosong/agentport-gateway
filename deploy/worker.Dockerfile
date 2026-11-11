@@ -3,7 +3,7 @@ WORKDIR /adapters
 COPY workers/acp/package*.json ./
 RUN npm ci --ignore-scripts --omit=dev
 
-FROM agentport-gateway:0.1.0
+FROM agentport-core:0.2.0
 USER root
 COPY --from=adapters /usr/local/bin/node /usr/local/bin/node
 COPY --from=adapters /adapters/node_modules /opt/acp/node_modules

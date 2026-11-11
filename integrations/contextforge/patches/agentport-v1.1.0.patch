@@ -1,0 +1,820 @@
+diff --git a/upstream/contextforge/mcpgateway/agentport.py b/upstream/contextforge/mcpgateway/agentport.py
+new file mode 100644
+index 0000000..752d759
+--- /dev/null
++++ b/upstream/contextforge/mcpgateway/agentport.py
+@@ -0,0 +1,202 @@
++"""Explicit AgentPort integration points for this controlled ContextForge fork.
++
++Copyright 2026 AgentPort contributors
++SPDX-License-Identifier: Apache-2.0
++"""
++
++import time
++from collections.abc import Awaitable, Callable, Mapping
++from contextlib import asynccontextmanager, contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++from types import MappingProxyType
++from typing import Any, AsyncContextManager
++
++from fastapi import FastAPI, Request
++
++LOCAL_INTEGRATION = "AGENTPORT_LOCAL"
++LOCAL_NAMESPACE = "io.agentport/local"
++SERVICE_NAMESPACE = "io.agentport/service"
++_backend_tool_id: ContextVar[str | None] = ContextVar("agentport_backend_tool_id", default=None)
++
++
++def is_internal_backend(payload: Mapping[str, Any]) -> bool:
++    """Identify managed backend tools that require a trusted local dispatch."""
++    metadata = payload.get("extension_metadata") or {}
++    binding = metadata.get(SERVICE_NAMESPACE) or {}
++    return isinstance(binding, Mapping) and binding.get("internal") is True
++
++
++@contextmanager
++def backend_invocation(tool_id: str):
++    """Authorize one exact managed backend within the current process context."""
++    if not isinstance(tool_id, str) or not tool_id:
++        raise ValueError("A managed backend tool ID is required")
++    token = _backend_tool_id.set(tool_id)
++    try:
++        yield
++    finally:
++        _backend_tool_id.reset(token)
++
++
++def require_backend_invocation(payload: Mapping[str, Any]) -> None:
++    """Reject direct invocation of managed backends, including operator calls."""
++    if is_internal_backend(payload) and _backend_tool_id.get() != payload.get("id"):
++        raise PermissionError("Managed backend requires an authorized AgentPort run")
++
++
++@dataclass(frozen=True)
++class AuthorizedInvocation:
++    """Carry native authenticated scope without exposing an authentication token."""
++
++    subject: str
++    teams: tuple[str, ...] | None
++    permissions: tuple[str, ...] | None = None
++    server_id: str | None = None
++    token_server_id: str | None = None
++    token_id: str | None = None
++    token_use: str | None = None
++    expires_at: int | None = None
++    auth_method: str | None = None
++    admin_bypass: bool = False
++
++
++@dataclass(frozen=True)
++class LocalTool:
++    """Describe the resolved native catalog entry supplied to a local handler."""
++
++    id: str
++    name: str
++    team_id: str | None
++    owner_email: str | None
++    visibility: str
++    extension_metadata: Mapping[str, Any]
++
++
++LocalHandler = Callable[[AuthorizedInvocation, LocalTool, dict], Awaitable[Any]]
++_handlers: Mapping[str, LocalHandler] = MappingProxyType({})
++_installer: Callable[[FastAPI], None] | None = None
++_lifespan: Callable[[FastAPI], AsyncContextManager] | None = None
++
++
++def configure(*, install_routes=None, lifespan=None, handlers: Mapping[str, LocalHandler] | None = None) -> None:
++    """Configure code-owned handlers before importing the native application."""
++    global _handlers, _installer, _lifespan
++    _handlers = MappingProxyType(dict(handlers or {}))
++    _installer = install_routes
++    _lifespan = lifespan
++
++
++def install(app: FastAPI) -> None:
++    """Install configured routes through the explicit native assembly hook."""
++    if _installer is not None:
++        _installer(app)
++
++
++@asynccontextmanager
++async def lifespan(app: FastAPI):
++    """Start extension services after native startup and close them before native shutdown."""
++    if _lifespan is None:
++        yield
++    else:
++        async with _lifespan(app):
++            yield
++
++
++def caller_from_request(request: Request, user: Any, server_id: str | None = None) -> AuthorizedInvocation | None:
++    """Capture a caller after native HTTP authentication and scope enforcement."""
++    from mcpgateway.auth_context import (
++        get_internal_mcp_auth_context,
++        get_request_identity,
++        get_scoped_resource_access_context,
++    )
++
++    subject, _ = get_request_identity(request, user)
++    if not subject or subject == "anonymous":
++        return None
++    _, teams = get_scoped_resource_access_context(request, user)
++    internal = get_internal_mcp_auth_context(request)
++    cached = getattr(request.state, "_jwt_verified_payload", None)
++    payload = cached[1] if isinstance(cached, tuple) and len(cached) == 2 and isinstance(cached[1], dict) else {}
++    scopes = payload.get("scopes") or {}
++    token_server = scopes.get("server_id") if isinstance(scopes, dict) else None
++    permissions = getattr(request.state, "token_scopes", None)
++    if internal:
++        token_server = internal.get("scoped_server_id")
++        permissions = internal.get("scoped_permissions")
++    return AuthorizedInvocation(
++        subject=subject,
++        teams=None if teams is None else tuple(teams),
++        permissions=None if permissions is None else tuple(permissions),
++        server_id=server_id,
++        token_server_id=token_server,
++        token_id=getattr(request.state, "jti", None) or payload.get("jti") or (internal or {}).get("token_id"),
++        token_use=getattr(request.state, "token_use", None) or payload.get("token_use") or (internal or {}).get("token_use"),
++        expires_at=int(payload["exp"]) if payload.get("exp") is not None else (internal or {}).get("exp"),
++        auth_method=user.get("auth_method") if isinstance(user, dict) else None,
++        admin_bypass=teams is None,
++    )
++
++
++def caller_from_mcp(user: dict | None, server_id: str | None = None) -> AuthorizedInvocation | None:
++    """Capture the already validated native MCP transport context."""
++    if not user or user.get("is_authenticated") is not True:
++        return None
++    subject = user.get("email")
++    if not subject or subject == "anonymous":
++        return None
++    teams = user.get("teams", [])
++    if teams is None and user.get("is_admin") is not True:
++        return None
++    permissions = user.get("scoped_permissions")
++    return AuthorizedInvocation(
++        subject=subject,
++        teams=None if teams is None else tuple(teams),
++        permissions=None if permissions is None else tuple(permissions),
++        server_id=server_id,
++        token_server_id=user.get("scoped_server_id"),
++        token_id=user.get("token_id"),
++        token_use=user.get("token_use"),
++        expires_at=int(user["exp"]) if user.get("exp") is not None else None,
++        auth_method=user.get("auth_method"),
++        admin_bypass=teams is None and user.get("is_admin") is True,
++    )
++
++
++async def dispatch(caller: AuthorizedInvocation | None, payload: dict, arguments: dict) -> Any:
++    """Invoke a configured local operation after the native tool pipeline authorizes it."""
++    from mcpgateway.middleware.rbac import token_scope_grants
++
++    if not _handlers:
++        raise PermissionError("AgentPort local execution is disabled")
++    if not isinstance(caller, AuthorizedInvocation) or not caller.subject:
++        raise PermissionError("Native authenticated caller context is required")
++    if caller.expires_at is not None and caller.expires_at <= time.time():
++        raise PermissionError("Native caller token has expired")
++    if not token_scope_grants(list(caller.permissions) if caller.permissions is not None else None, "tools.execute"):
++        raise PermissionError("Token does not permit local tool execution")
++    if caller.token_server_id and caller.token_server_id != caller.server_id:
++        raise PermissionError("Token virtual-server scope does not match")
++    metadata = payload.get("extension_metadata") or {}
++    binding = metadata.get(LOCAL_NAMESPACE) or {}
++    operation = binding.get("operation")
++    handler = _handlers.get(operation) if isinstance(operation, str) else None
++    if handler is None:
++        raise PermissionError("Local operation is not registered")
++    tool = LocalTool(
++        id=payload["id"],
++        name=payload["name"],
++        team_id=payload.get("team_id"),
++        owner_email=payload.get("owner_email"),
++        visibility=payload.get("visibility", "private"),
++        extension_metadata=MappingProxyType(metadata),
++    )
++    return await handler(caller, tool, arguments)
++
++
++async def require_local_registration(user: dict, db: Any, request: Request) -> None:
++    """Require native operator permissions before changing local execution bindings."""
++    from mcpgateway.middleware.rbac import check_permission_inline
++
++    if not await check_permission_inline(user, "admin.system_config", db=db, request=request):
++        raise PermissionError("Operator permission is required for local tool bindings")
+diff --git a/upstream/contextforge/mcpgateway/bootstrap_db.py b/upstream/contextforge/mcpgateway/bootstrap_db.py
+index 34a8cb0..4803682 100644
+--- a/upstream/contextforge/mcpgateway/bootstrap_db.py
++++ b/upstream/contextforge/mcpgateway/bootstrap_db.py
+@@ -675,9 +675,8 @@ def normalize_team_visibility(conn: Connection) -> int:
+ async def bootstrap_resource_assignments(conn: Connection) -> None:
+     """Assign orphaned resources to the platform admin's personal team.
+ 
+-    This ensures existing resources (from pre-multitenancy versions) are
+-    visible in the new team-based UI by assigning them to the admin's
+-    personal team with public visibility.
++    Resources without ownership or visibility receive a legacy assignment.
++    Owned resources retain their visibility, including private resources without a team.
+ 
+     Args:
+         conn: Active SQLAlchemy connection
+@@ -732,7 +731,7 @@ async def bootstrap_resource_assignments(conn: Connection) -> None:
+             for resource_name, resource_model in resource_types:
+                 try:
+                     # Find unassigned resources
+-                    unassigned = db.query(resource_model).filter((resource_model.team_id.is_(None)) | (resource_model.owner_email.is_(None)) | (resource_model.visibility.is_(None))).all()
++                    unassigned = db.query(resource_model).filter((resource_model.owner_email.is_(None)) | (resource_model.visibility.is_(None))).all()
+ 
+                     if not unassigned:
+                         continue
+diff --git a/upstream/contextforge/mcpgateway/common/models.py b/upstream/contextforge/mcpgateway/common/models.py
+index 9bb4ee3..6ce209b 100644
+--- a/upstream/contextforge/mcpgateway/common/models.py
++++ b/upstream/contextforge/mcpgateway/common/models.py
+@@ -635,6 +635,7 @@ class Tool(CommonAttributes):
+     """
+ 
+     model_config = ConfigDict(from_attributes=True)
++    url: Optional[AnyHttpUrl] = None
+     original_name: Optional[str] = None
+     integration_type: str = "MCP"
+     request_type: str = "SSE"
+diff --git a/upstream/contextforge/mcpgateway/main.py b/upstream/contextforge/mcpgateway/main.py
+index a3b5759..3e94a11 100644
+--- a/upstream/contextforge/mcpgateway/main.py
++++ b/upstream/contextforge/mcpgateway/main.py
+@@ -94,6 +94,7 @@ from mcpgateway.common.models import JSONRPCError as PydanticJSONRPCError
+ from mcpgateway.common.models import ListResourceTemplatesResult, LogLevel, Root
+ from mcpgateway.common.query_params import QueryGatewayId, QueryPaginationCursor, QueryTeamId, QueryVisibility
+ from mcpgateway.common.validators import SecurityValidator, url_scheme_allowed
++from mcpgateway import agentport as agentport_extension
+ from mcpgateway.config import get_settings, SecurityConfigurationError, settings
+ from mcpgateway.db import A2AAgent as DbA2AAgent
+ from mcpgateway.db import A2APushNotificationConfig
+@@ -521,6 +522,8 @@ def _build_internal_mcp_auth_context_for_rpc(request: Request, user: Any) -> Dic
+         "permission_is_admin": bool(is_admin) if is_authenticated else False,
+         "auth_method": payload.get("auth_method") or ("jwt" if is_authenticated else "anonymous"),
+         "token_use": payload.get("token_use"),
++        "token_id": payload.get("jti"),
++        "exp": payload.get("exp"),
+     }
+     if scoped_permissions is not None:
+         context["scoped_permissions"] = scoped_permissions
+@@ -1845,7 +1848,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+         elif settings.metrics_aggregation_enabled:
+             logger.info("Metrics aggregation auto-start disabled; performance metrics will be generated on-demand when requested.")
+ 
+-        yield
++        async with agentport_extension.lifespan(_app):
++            yield
+     except Exception as e:
+         logger.error(f"Error during startup: {str(e)}")
+         # For plugin errors, exit cleanly without stack trace spam
+@@ -5792,6 +5796,8 @@ async def create_tool(
+         HTTPException: If the tool name already exists or other validation errors occur.
+     """
+     try:
++        if tool.integration_type == "AGENTPORT_LOCAL":
++            await agentport_extension.require_local_registration(user, db, request)
+         # Extract metadata from request
+         metadata = MetadataCapture.extract_creation_metadata(request, user)
+ 
+@@ -5835,12 +5841,15 @@ async def create_tool(
+             team_id=team_id,
+             owner_email=user_email,
+             visibility=tool.visibility,
++            local_registration_authorized=tool.integration_type == agentport_extension.LOCAL_INTEGRATION,
+         )
+         db.commit()
+         db.close()
+         return result
+     except Exception as ex:
+         logger.error(f"Error while creating tool: {ex}")
++        if isinstance(ex, PermissionError):
++            raise HTTPException(status_code=403, detail=str(ex))
+         if isinstance(ex, ToolNameConflictError):
+             if not ex.enabled and ex.tool_id:
+                 raise HTTPException(
+@@ -6016,6 +6025,9 @@ async def update_tool(
+     try:
+         # Get current tool to extract current version
+         current_tool = db.get(DbTool, tool_id)
++        local_registration = tool.integration_type == agentport_extension.LOCAL_INTEGRATION or getattr(current_tool, "integration_type", None) == agentport_extension.LOCAL_INTEGRATION
++        if local_registration:
++            await agentport_extension.require_local_registration(user, db, request)
+         current_version = getattr(current_tool, "version", 0) if current_tool else 0
+ 
+         # Extract modification metadata
+@@ -6032,6 +6044,7 @@ async def update_tool(
+             modified_via=mod_metadata["modified_via"],
+             modified_user_agent=mod_metadata["modified_user_agent"],
+             user_email=user_email,
++            local_registration_authorized=local_registration,
+         )
+         db.commit()
+         db.close()
+@@ -10579,14 +10592,11 @@ async def _execute_rpc_tools_call(
+     if not name:
+         raise JSONRPCError(-32602, "Missing tool name in parameters", params)
+ 
+-    # Layer-1 exception: run ownership is captured below from the raw context,
+-    # before admin-bypass normalization is applied.
++    # Preserve the authenticated owner; native admin bypass excludes other users' private tools.
+     auth_user_email, auth_token_teams, auth_is_admin = get_rpc_filter_context(request, user)
+     run_owner_email = auth_user_email
+     run_owner_team_ids = [] if auth_token_teams is None else list(auth_token_teams)
+-    if auth_is_admin and auth_token_teams is None:
+-        auth_user_email = None
+-    elif auth_token_teams is None:
++    if not auth_is_admin and auth_token_teams is None:
+         auth_token_teams = []
+ 
+     oauth_user_email = get_user_email(user)
+@@ -10644,6 +10654,7 @@ async def _execute_rpc_tools_call(
+                     plugin_context_table=plugin_context_table,
+                     plugin_global_context=plugin_global_context,
+                     meta_data=meta_data,
++                    caller_context=agentport_extension.caller_from_request(request, user, server_id),
+                     skip_pre_invoke=skip_pre_invoke,
+                     require_model_visible=True,
+                 )
+@@ -11733,10 +11744,7 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
+             # Layer-1 exception: tool-execution authorization, not resource visibility.
+             # Kept in sync with _execute_rpc_tools_call.
+             auth_user_email, auth_token_teams, auth_is_admin = get_rpc_filter_context(request, user)
+-            if auth_is_admin and auth_token_teams is None:
+-                auth_user_email = None
+-                # auth_token_teams stays None (unrestricted)
+-            elif auth_token_teams is None:
++            if not auth_is_admin and auth_token_teams is None:
+                 auth_token_teams = []  # Non-admin without teams = public-only
+ 
+             # Get user email for OAuth token selection
+@@ -11769,6 +11777,7 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
+                     plugin_context_table=plugin_context_table,
+                     plugin_global_context=plugin_global_context,
+                     meta_data=meta_data,
++                    caller_context=agentport_extension.caller_from_request(request, user, server_id),
+                     require_model_visible=True,
+                 )
+                 if hasattr(result, "model_dump"):
+@@ -13161,3 +13170,7 @@ else:
+ # Expose some endpoints at the root level as well
+ app.post("/initialize")(initialize)
+ app.post("/notifications")(handle_notification)
++
++
++# AgentPort controlled-fork extension assembly.
++agentport_extension.install(app)
+diff --git a/upstream/contextforge/mcpgateway/middleware/token_scoping.py b/upstream/contextforge/mcpgateway/middleware/token_scoping.py
+index 33d7bfd..bf5157e 100644
+--- a/upstream/contextforge/mcpgateway/middleware/token_scoping.py
++++ b/upstream/contextforge/mcpgateway/middleware/token_scoping.py
+@@ -205,6 +205,21 @@ _PERMISSION_PATTERNS: List[Tuple[str, Pattern[str], str]] = [
+     ("GET", re.compile(r"^/a2a-agents/plugin-bindings(?:$|/)"), Permissions.TOOLS_READ),
+     ("POST", re.compile(r"^/a2a-agents/plugin-bindings(?:$|/)"), Permissions.TOOLS_MANAGE_PLUGINS),
+     ("DELETE", re.compile(r"^/a2a-agents/plugin-bindings(?:$|/)"), Permissions.TOOLS_MANAGE_PLUGINS),
++    # AgentPort paths stay explicit so new routes require a permission decision.
++    ("GET", re.compile(r"^/orchestration/v1/(?:me|worker-public-key|harnesses|services|agents|workflows|runtimes|providers|runs|sessions|credentials)/?$"), Permissions.TOOLS_READ),
++    ("GET", re.compile(r"^/orchestration/v1/(?:runtimes|providers|runs|artifacts)/[^/]+/?$"), Permissions.TOOLS_READ),
++    ("GET", re.compile(r"^/orchestration/v1/(?:services|agents|workflows|runtimes)/[^/]+/export/?$"), Permissions.TOOLS_READ),
++    ("GET", re.compile(r"^/orchestration/v1/services/[^/]+/runtime/?$"), Permissions.TOOLS_READ),
++    ("POST", re.compile(r"^/orchestration/v1/(?:services|agents|workflows)/[^/]+/invoke/?$"), Permissions.TOOLS_EXECUTE),
++    ("POST", re.compile(r"^/orchestration/v1/runs/[^/]+/(?:cancel|permissions/[^/]+|steps/[^/]+/(?:approve|resolve))/?$"), Permissions.TOOLS_EXECUTE),
++    ("POST", re.compile(r"^/orchestration/v1/(?:agents|workflows|providers|credentials|artifacts)/?$"), Permissions.TOOLS_EXECUTE),
++    ("POST", re.compile(r"^/orchestration/v1/credentials/native/?$"), Permissions.TOOLS_EXECUTE),
++    ("PUT", re.compile(r"^/orchestration/v1/(?:agents|workflows|providers)/[^/]+/?$"), Permissions.TOOLS_EXECUTE),
++    ("POST", re.compile(r"^/orchestration/v1/(?:services|runtimes)/?$"), Permissions.ADMIN_SYSTEM_CONFIG),
++    ("PUT", re.compile(r"^/orchestration/v1/(?:services|runtimes)/[^/]+/?$"), Permissions.ADMIN_SYSTEM_CONFIG),
++    ("POST", re.compile(r"^/orchestration/v1/(?:services|runtimes)/[^/]+/operations/(?:start|stop|update)/?$"), Permissions.ADMIN_SYSTEM_CONFIG),
++    ("POST", re.compile(r"^/orchestration/v1/(?:services|runtimes)/[^/]+/releases/[^/]+/deploy/?$"), Permissions.ADMIN_SYSTEM_CONFIG),
++    ("POST", re.compile(r"^/orchestration/v1/(?:services|runtimes)/[^/]+/reconcile/?$"), Permissions.ADMIN_SYSTEM_CONFIG),
+ ]
+ 
+ # Admin route permission map (granular by route group).
+diff --git a/upstream/contextforge/mcpgateway/schemas.py b/upstream/contextforge/mcpgateway/schemas.py
+index 3a88f9e..de9a262 100644
+--- a/upstream/contextforge/mcpgateway/schemas.py
++++ b/upstream/contextforge/mcpgateway/schemas.py
+@@ -840,7 +840,7 @@ class ToolCreate(BaseModel):
+     title: Optional[str] = Field(None, max_length=255, description="Human-readable title for the tool (MCP BaseMetadata)")
+     url: Optional[Union[str, AnyHttpUrl]] = Field(None, description="Tool endpoint URL")
+     description: Optional[str] = Field(None, description="Tool description")
+-    integration_type: Literal["REST", "MCP", "A2A"] = Field("REST", description="'REST' for individual endpoints, 'MCP' for gateway-discovered tools, 'A2A' for A2A agents")
++    integration_type: Literal["REST", "MCP", "A2A", "AGENTPORT_LOCAL"] = Field("REST", description="'REST' for individual endpoints, 'MCP' for gateway-discovered tools, 'A2A' for A2A agents")
+     request_type: Literal["GET", "POST", "PUT", "DELETE", "PATCH", "SSE", "STDIO", "STREAMABLEHTTP"] = Field("SSE", description="HTTP method to be used for invoking the tool")
+     headers: Optional[Dict[str, str]] = Field(None, description="Additional headers to send when invoking the tool")
+     input_schema: Optional[Dict[str, Any]] = Field(default_factory=lambda: dict(_DEFAULT_INPUT_SCHEMA), description="JSON Schema for validating tool parameters", alias="inputSchema")
+@@ -874,6 +874,27 @@ class ToolCreate(BaseModel):
+     plugin_chain_pre: Optional[List[str]] = Field(None, description="Pre-plugin chain for passthrough")
+     plugin_chain_post: Optional[List[str]] = Field(None, description="Post-plugin chain for passthrough")
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def default_local_request_type(cls, values):
++        """Set the non-network request type for local operations."""
++        if isinstance(values, dict) and values.get("integration_type") == "AGENTPORT_LOCAL":
++            values = dict(values)
++            values.setdefault("request_type", "POST")
++        return values
++
++    @model_validator(mode="after")
++    def validate_local_integration(self):
++        """Reject network configuration on code-owned local operations."""
++        if self.integration_type == "AGENTPORT_LOCAL":
++            if self.url is not None or self.gateway_id or self.auth or self.headers:
++                raise ValueError("Local tools cannot configure network endpoints or upstream credentials")
++            self.expose_passthrough = None
++            binding = (self.extension_metadata or {}).get("io.agentport/local")
++            if not isinstance(binding, dict) or not isinstance(binding.get("operation"), str):
++                raise ValueError("Local tools require an operation binding")
++        return self
++
+     @field_validator("tags")
+     @classmethod
+     def validate_tags(cls, v: Optional[List[Union[str, Dict[str, str]]]]) -> List[Dict[str, str]]:
+@@ -1128,7 +1149,7 @@ class ToolCreate(BaseModel):
+ 
+         integration_type = info.data.get("integration_type")
+ 
+-        if integration_type not in ["REST", "MCP", "A2A"]:
++        if integration_type not in ["REST", "MCP", "A2A", "AGENTPORT_LOCAL"]:
+             raise ValueError(f"Unknown integration type: {integration_type}")
+ 
+         if integration_type == "REST":
+@@ -1139,7 +1160,7 @@ class ToolCreate(BaseModel):
+             allowed = ["SSE", "STDIO", "STREAMABLEHTTP"]
+             if v not in allowed:
+                 raise ValueError(f"Request type '{v}' not allowed for MCP. Only {allowed} transports are accepted.")
+-        elif integration_type == "A2A":
++        elif integration_type in {"A2A", "AGENTPORT_LOCAL"}:
+             allowed = ["POST"]
+             if v not in allowed:
+                 raise ValueError(f"Request type '{v}' not allowed for A2A. Only {allowed} methods are accepted.")
+@@ -1227,7 +1248,12 @@ class ToolCreate(BaseModel):
+ 
+     @model_validator(mode="before")
+     @classmethod
+-    def prevent_manual_mcp_creation(cls, values: Dict[str, Any]) -> Dict[str, Any]:
++    def validate_mcp_creation_context(cls, values: Dict[str, Any], info: ValidationInfo) -> Dict[str, Any]:
++        """Keep process-only managed MCP authorization out of request fields."""
++        return cls.prevent_manual_mcp_creation(values, info)
++
++    @classmethod
++    def prevent_manual_mcp_creation(cls, values: Dict[str, Any], info: Optional[ValidationInfo] = None) -> Dict[str, Any]:
+         """
+         Prevent manual creation of MCP tools via API.
+ 
+@@ -1245,7 +1271,9 @@ class ToolCreate(BaseModel):
+         """
+         integration_type = values.get("integration_type")
+         allow_auto = values.get("allow_auto", False)
+-        if integration_type == "MCP":
++        internal = (values.get("extensionMetadata") or values.get("extension_metadata") or {}).get("io.agentport/service", {}).get("internal") is True
++        trusted_managed_mcp = bool(info and info.context and info.context.get("agentport_internal_mcp") is True and internal)
++        if integration_type == "MCP" and not trusted_managed_mcp:
+             raise ValueError("Cannot manually create MCP tools. Add MCP servers via the Gateways interface - tools will be auto-discovered and registered with integration_type='MCP'.")
+         if integration_type == "A2A" and not allow_auto:
+             raise ValueError("Cannot manually create A2A tools. Add A2A agents via the A2A interface - tools will be auto-created when agents are associated with servers.")
+@@ -1442,8 +1470,8 @@ class ToolUpdate(BaseModelWithConfigDict):
+     custom_name: Optional[str] = Field(None, description="Custom name for the tool")
+     url: Optional[Union[str, AnyHttpUrl]] = Field(None, description="Tool endpoint URL")
+     description: Optional[str] = Field(None, description="Tool description")
+-    integration_type: Optional[Literal["REST", "MCP", "A2A"]] = Field(None, description="Tool integration type")
+-    request_type: Optional[Literal["GET", "POST", "PUT", "DELETE", "PATCH"]] = Field(None, description="HTTP method to be used for invoking the tool")
++    integration_type: Optional[Literal["REST", "MCP", "A2A", "AGENTPORT_LOCAL"]] = Field(None, description="Tool integration type")
++    request_type: Optional[Literal["GET", "POST", "PUT", "DELETE", "PATCH", "SSE", "STDIO", "STREAMABLEHTTP"]] = Field(None, description="HTTP method or MCP transport used for invoking the tool")
+     headers: Optional[Dict[str, str]] = Field(None, description="Additional headers to send when invoking the tool")
+     input_schema: Optional[Dict[str, Any]] = Field(None, description="JSON Schema for validating tool parameters")
+     output_schema: Optional[Dict[str, Any]] = Field(None, description="JSON Schema for validating tool output")
+@@ -1638,7 +1666,7 @@ class ToolUpdate(BaseModelWithConfigDict):
+             allowed = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+         elif integration_type == "MCP":
+             allowed = ["SSE", "STDIO", "STREAMABLEHTTP"]
+-        elif integration_type == "A2A":
++        elif integration_type in {"A2A", "AGENTPORT_LOCAL"}:
+             allowed = ["POST"]  # A2A agents typically use POST
+         else:
+             raise ValueError(f"Unknown integration type: {integration_type}")
+diff --git a/upstream/contextforge/mcpgateway/services/tool_service.py b/upstream/contextforge/mcpgateway/services/tool_service.py
+index 9e9a2b2..e180a97 100644
+--- a/upstream/contextforge/mcpgateway/services/tool_service.py
++++ b/upstream/contextforge/mcpgateway/services/tool_service.py
+@@ -69,6 +69,7 @@ from mcpgateway.common.models import Tool as PydanticTool
+ from mcpgateway.common.models import ToolAnnotations
+ from mcpgateway.common.models import ToolResult
+ from mcpgateway.common.validators import pin_url_to_resolved_ip, SecurityValidator
++from mcpgateway import agentport as agentport_extension
+ from mcpgateway.config import settings
+ from mcpgateway.db import A2AAgent as DbA2AAgent
+ from mcpgateway.db import fresh_db_session
+@@ -243,9 +244,17 @@ def _sync_meta_traceparent(
+     return updated_meta
+ 
+ 
+-def _build_pinned_rest_http_client() -> ResilientHttpClient:
+-    """Build an isolated client for IP-pinned REST requests."""
++def _build_pinned_rest_http_client(*, max_attempts: Optional[int] = None) -> ResilientHttpClient:
++    """Build an isolated REST client with an optional total-attempt limit.
++
++    Args:
++        max_attempts: Total HTTP attempts, including the first request.
++
++    Returns:
++        An isolated HTTP client for this invocation.
++    """
+     return ResilientHttpClient(
++        max_retries=settings.retry_max_attempts if max_attempts is None else max_attempts,
+         client_args={
+             "timeout": settings.federation_timeout,
+             "verify": not settings.skip_ssl_verify,
+@@ -2291,6 +2300,8 @@ class ToolService(BaseService):
+         team_id: Optional[str] = None,
+         owner_email: Optional[str] = None,
+         visibility: str = None,
++        *,
++        local_registration_authorized: bool = False,
+     ) -> ToolRead:
+         """Register a new tool with team support.
+ 
+@@ -2306,6 +2317,7 @@ class ToolService(BaseService):
+             team_id: Optional team ID to assign tool to.
+             owner_email: Optional owner email for tool ownership.
+             visibility: Tool visibility (private, team, public).
++            local_registration_authorized: Native operator authorization for local bindings.
+ 
+         Returns:
+             Created tool information.
+@@ -2339,6 +2351,9 @@ class ToolService(BaseService):
+             >>> asyncio.run(service.register_tool(db, tool))
+             'tool_read'
+         """
++        if tool.integration_type == agentport_extension.LOCAL_INTEGRATION and not local_registration_authorized:
++            raise PermissionError("Local tool registration requires an authorized operator")
++
+         try:
+             if tool.auth is None:
+                 auth_type = None
+@@ -2411,7 +2426,7 @@ class ToolService(BaseService):
+                 custom_name_slug=slugify(tool.name),
+                 display_name=tool.displayName or tool.name,
+                 title=tool.title,
+-                url=str(tool.url),
++                url=None if tool.integration_type == agentport_extension.LOCAL_INTEGRATION else str(tool.url),
+                 description=tool.description,
+                 original_description=tool.description,
+                 integration_type=tool.integration_type,
+@@ -2912,6 +2927,9 @@ class ToolService(BaseService):
+                 and either "tool" (DbTool object) or "error" (error message).
+         """
+         try:
++            existing_local = existing_tools_map.get(tool.name)
++            if tool.integration_type == agentport_extension.LOCAL_INTEGRATION or getattr(existing_local, "integration_type", None) == agentport_extension.LOCAL_INTEGRATION:
++                return {"status": "fail", "error": "Local bindings require the operator registration endpoint"}
+             # Same three US-3 malicious-pattern scans that register_tool() runs.
+             # Keep these in lock-step with the single-tool path.
+             if tool.name:
+@@ -5269,6 +5287,7 @@ class ToolService(BaseService):
+         require_model_visible: bool = False,
+         retry_attempt: int = 0,
+         *,
++        caller_context: Optional[agentport_extension.AuthorizedInvocation] = None,
+         progress_callback: Optional[Any] = None,
+         allow_input_required: bool = False,
+         input_responses: Optional[Any] = None,
+@@ -5302,6 +5321,7 @@ class ToolService(BaseService):
+             require_model_visible: When True, deny execution unless the resolved tool is model-visible.
+             retry_attempt: Zero-based retry counter; 0 = original call.  Incremented by the retry
+                 loop and compared against ``settings.max_tool_retries``.
++            caller_context: Native authenticated scope required by local operations.
+             progress_callback: Optional async callable (progress, total, message) invoked for
+                 each progress update the upstream server emits during the call.
+             allow_input_required: When True, an upstream InputRequiredResult (2026 MRTR)
+@@ -5345,16 +5365,21 @@ class ToolService(BaseService):
+         # ═══════════════════════════════════════════════════════════════════════════
+         resolved = await self._resolve_tool_for_invocation(db, name, request_headers, user_email, token_teams, server_id, require_app_visible, require_model_visible, arguments=arguments)
+         if resolved.schema_validation_error:
++            if resolved.tool_payload.get("integration_type") == agentport_extension.LOCAL_INTEGRATION:
++                raise ToolInvocationError("Local tool arguments do not match the registered schema")
+             raise ToolInvocationError(f"Invalid arguments for tool '{name}': {resolved.schema_validation_error}")
+         is_direct_proxy = resolved.is_direct_proxy
+         tool = resolved.tool
+         gateway = resolved.gateway
+         tool_payload = resolved.tool_payload
+         gateway_payload = resolved.gateway_payload
++        agentport_extension.require_backend_invocation(tool_payload)
+ 
+         # Extract A2A-related data from annotations (will be used after db.close() if A2A tool)
+         tool_annotations = tool_payload.get("annotations") or {}
+         tool_integration_type = tool_payload.get("integration_type")
++        managed_backend = agentport_extension.is_internal_backend(tool_payload)
++        allow_proxy_retry = tool_integration_type != agentport_extension.LOCAL_INTEGRATION and not managed_backend
+ 
+         # Get passthrough headers from in-memory cache (Issue #1715)
+         # This eliminates 42,000+ redundant DB queries under load
+@@ -5408,6 +5433,8 @@ class ToolService(BaseService):
+         # to avoid checking ORM object truthiness after session is closed
+         has_gateway = gateway_payload is not None
+         gateway_url = gateway_payload.get("url") if has_gateway else None
++        if managed_backend and tool_integration_type == "MCP" and not has_gateway:
++            gateway_url = tool_url
+         gateway_name = gateway_payload.get("name") if has_gateway else None
+         gateway_auth_type = gateway_payload.get("auth_type") if has_gateway else None
+         gateway_auth_value = gateway_payload.get("auth_value") if has_gateway and isinstance(gateway_payload.get("auth_value"), str) else None
+@@ -5669,7 +5696,44 @@ class ToolService(BaseService):
+                 if has_gateway and gateway_auth_type == "oauth" and isinstance(gateway_oauth_config, dict) and gateway_oauth_config:
+                     gateway_grant_type = gateway_oauth_config.get("grant_type", "client_credentials")
+ 
+-                if tool_integration_type == "REST":
++                if tool_integration_type == agentport_extension.LOCAL_INTEGRATION:
++                    if skip_pre_invoke:
++                        raise ToolInvocationError("Local tools require the native Python policy pipeline")
++                    if plugin_manager and plugin_manager.has_hooks_for(ToolHookType.TOOL_PRE_INVOKE):
++                        if tool_metadata:
++                            global_context.metadata[TOOL_METADATA] = tool_metadata
++                        try:
++                            pre_result, context_table = await plugin_manager.invoke_hook(
++                                ToolHookType.TOOL_PRE_INVOKE,
++                                payload=ToolPreInvokePayload(name=name, args=arguments),
++                                global_context=global_context,
++                                local_contexts=context_table,
++                                violations_as_exceptions=True,
++                                extensions=build_request_extensions(),
++                            )
++                        except PluginViolationError as exc:
++                            _ctl_acc.add_violation(exc, hook="pre")
++                            raise
++                        record_plugin_metrics(current_trace_id.get(), pre_result.metadata)
++                        _ctl_acc.add(pre_result, hook="pre")
++                        if pre_result.modified_payload:
++                            if pre_result.modified_payload.name != name:
++                                raise ToolInvocationError("Plugins cannot retarget local operations")
++                            arguments = pre_result.modified_payload.args or {}
++                    schema_error = await asyncio.to_thread(_validate_tool_input_arguments, arguments, tool_payload.get("input_schema"))
++                    if schema_error:
++                        raise ToolInvocationError("Local tool arguments do not match the registered schema")
++                    try:
++                        value = await agentport_extension.dispatch(caller_context, tool_payload, arguments)
++                        if tool_output_schema:
++                            await asyncio.to_thread(_validate_with_cached_schema, value, tool_output_schema)
++                    except Exception as exc:
++                        raise ToolInvocationError(f"Local operation failed ({type(exc).__name__})") from None
++                    tool_result = value if isinstance(value, ToolResult) else ToolResult(
++                        content=[TextContent(type="text", text=orjson.dumps(value).decode())], structured_content=value
++                    )
++                    success = not tool_result.is_error
++                elif tool_integration_type == "REST":
+                     # Handle OAuth authentication for REST tools
+                     if tool_auth_type == "oauth" and isinstance(tool_oauth_config, dict) and tool_oauth_config:
+                         try:
+@@ -5855,6 +5919,10 @@ class ToolService(BaseService):
+                         headers = {hk: hv for hk, hv in headers.items() if hk.lower() != "host"}
+                         headers["Host"] = original_authority
+                         rest_request_extensions["sni_hostname"] = original_hostname
++                    if managed_backend:
++                        pinned_rest_http_client = _build_pinned_rest_http_client(max_attempts=1)
++                        rest_http_client = pinned_rest_http_client
++                    elif resolved_ip and original_hostname and original_authority:
+                         pinned_rest_http_client = _build_pinned_rest_http_client()
+                         rest_http_client = pinned_rest_http_client
+ 
+@@ -7112,7 +7180,7 @@ class ToolService(BaseService):
+                     # retry_attempt is 0-based (0 = original call).  The condition allows retry_attempt
+                     # values 0..max_tool_retries-1, meaning up to max_tool_retries *retry* attempts on
+                     # top of the original call (total attempts = max_tool_retries + 1).
+-                    if post_result is not None and post_result.retry_delay_ms > 0 and retry_attempt < settings.max_tool_retries:
++                    if allow_proxy_retry and post_result is not None and post_result.retry_delay_ms > 0 and retry_attempt < settings.max_tool_retries:
+                         return await self._retry_tool_invocation(
+                             post_result.retry_delay_ms,
+                             retry_attempt,
+@@ -7171,7 +7239,7 @@ class ToolService(BaseService):
+                     set_span_error(span, error_message)
+ 
+                 # Retry if the post-invoke hook (called by the timeout handler) requested it.
+-                if e.retry_delay_ms > 0 and retry_attempt < settings.max_tool_retries:
++                if allow_proxy_retry and e.retry_delay_ms > 0 and retry_attempt < settings.max_tool_retries:
+                     return await self._retry_tool_invocation(
+                         e.retry_delay_ms,
+                         retry_attempt,
+@@ -7249,7 +7317,7 @@ class ToolService(BaseService):
+                 # Retry if the plugin requested a delayed retry and we haven't hit the ceiling.
+                 # Same counting convention as the success path: retry_attempt is 0-based,
+                 # so this allows up to max_tool_retries retry attempts beyond the original call.
+-                if exc_post_result is not None and exc_post_result.retry_delay_ms > 0 and retry_attempt < settings.max_tool_retries:
++                if allow_proxy_retry and exc_post_result is not None and exc_post_result.retry_delay_ms > 0 and retry_attempt < settings.max_tool_retries:
+                     return await self._retry_tool_invocation(
+                         exc_post_result.retry_delay_ms,
+                         retry_attempt,
+@@ -7677,6 +7745,8 @@ class ToolService(BaseService):
+         modified_via: Optional[str] = None,
+         modified_user_agent: Optional[str] = None,
+         user_email: Optional[str] = None,
++        *,
++        local_registration_authorized: bool = False,
+     ) -> ToolRead:
+         """
+         Update an existing tool.
+@@ -7690,6 +7760,7 @@ class ToolService(BaseService):
+             modified_via (Optional[str]): Modification method (ui, api).
+             modified_user_agent (Optional[str]): User agent of modification request.
+             user_email (Optional[str]): Email of user performing update (for ownership check).
++            local_registration_authorized: Native operator authorization for local bindings.
+ 
+         Returns:
+             The updated ToolRead object.
+@@ -7723,6 +7794,17 @@ class ToolService(BaseService):
+         """
+         try:
+             tool = get_for_update(db, DbTool, tool_id)
++            if tool is not None and (agentport_extension.LOCAL_INTEGRATION in (tool.integration_type, tool_update.integration_type)):
++                if not local_registration_authorized:
++                    raise PermissionError("Local tool updates require an authorized operator")
++                if tool.integration_type != agentport_extension.LOCAL_INTEGRATION or tool_update.integration_type not in {None, agentport_extension.LOCAL_INTEGRATION}:
++                    raise ToolError("Create a new tool to change its local integration type")
++                if tool_update.url or tool_update.gateway_id or tool_update.auth or tool_update.headers:
++                    raise ToolError("Local tools cannot configure network endpoints or upstream credentials")
++                if tool_update.extension_metadata is not None:
++                    binding = tool_update.extension_metadata.get(agentport_extension.LOCAL_NAMESPACE)
++                    if not isinstance(binding, dict) or not isinstance(binding.get("operation"), str):
++                        raise ToolError("Local tools require an operation binding")
+ 
+             if not tool:
+                 raise ToolNotFoundError(f"Tool not found: {tool_id}")
+diff --git a/upstream/contextforge/mcpgateway/toolops/toolops_altk_service.py b/upstream/contextforge/mcpgateway/toolops/toolops_altk_service.py
+index 4c49eb4..e412c2f 100644
+--- a/upstream/contextforge/mcpgateway/toolops/toolops_altk_service.py
++++ b/upstream/contextforge/mcpgateway/toolops/toolops_altk_service.py
+@@ -47,6 +47,7 @@ except ImportError:
+ from sqlalchemy.orm import Session
+ 
+ # First-Party
++from mcpgateway import agentport as agentport_extension
+ from mcpgateway.schemas import ToolRead, ToolUpdate
+ from mcpgateway.services.logging_service import LoggingService
+ from mcpgateway.services.mcp_client_chat_service import LLMConfig, MCPChatService, MCPClientConfig, MCPServerConfig
+@@ -201,6 +202,8 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service:
+         tool_test_case_outputs: list of tool outputs after tool test cases execution with agent.
+     """
+     tool_schema: ToolRead = await tool_service.get_tool(db, tool_id)
++    if tool_schema.integration_type == agentport_extension.LOCAL_INTEGRATION or agentport_extension.is_internal_backend({"extension_metadata": tool_schema.extension_metadata}):
++        raise PermissionError("Managed tools require the authorized AgentPort execution pipeline")
+     mcp_cf_tool = tool_schema.to_dict(use_alias=True)
+     tool_url = mcp_cf_tool.get("url")
+     tool_auth = query_tool_auth(tool_id, db)
+diff --git a/upstream/contextforge/mcpgateway/transports/streamablehttp_transport.py b/upstream/contextforge/mcpgateway/transports/streamablehttp_transport.py
+index 65a21a7..0ff0f12 100644
+--- a/upstream/contextforge/mcpgateway/transports/streamablehttp_transport.py
++++ b/upstream/contextforge/mcpgateway/transports/streamablehttp_transport.py
+@@ -67,6 +67,7 @@ from mcpgateway import __version__
+ from mcpgateway.cache.global_config_cache import global_config_cache
+ from mcpgateway.common.models import LogLevel
+ from mcpgateway.common.validators import validate_meta_data as _validate_meta_data
++from mcpgateway import agentport as agentport_extension
+ from mcpgateway.config import settings
+ from mcpgateway.db import Gateway as DbGateway
+ from mcpgateway.db import Prompt as DbPrompt
+@@ -2063,6 +2064,8 @@ async def call_tool(
+ 
+     # Check if we're in direct_proxy mode by looking for X-Context-Forge-Gateway-Id header
+     gateway_id_from_header = extract_gateway_id_from_headers(request_headers)
++    if gateway_id_from_header and (server_id or (user_context or {}).get("scoped_server_id")):
++        raise PermissionError("Server-scoped callers cannot override gateway routing")
+ 
+     # If X-Context-Forge-Gateway-Id header is present, use direct proxy mode
+     if gateway_id_from_header:
+@@ -2237,6 +2240,7 @@ async def call_tool(
+                 request_state=inbound_request_state,
+                 plugin_global_context=plugin_global_context,
+                 plugin_context_table=plugin_context_table,
++                caller_context=agentport_extension.caller_from_mcp(user_context, server_id),
+             )
+             # A result may carry its data only in structuredContent; only an empty result on both counts is "no content".
+             if not result or (not result.content and not isinstance(getattr(result, "structured_content", None), (dict, list, str, int, float, bool))):
+@@ -2735,6 +2739,7 @@ async def _normalize_jwt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+ 
+     user_ctx: dict[str, Any] = {
+         "email": email,
++        "token_id": payload.get("jti"),
+         "teams": final_teams,
+         "is_admin": effective_is_admin,
+         "is_authenticated": True,
+@@ -5723,6 +5728,7 @@ def get_streamable_http_auth_context() -> dict[str, Any]:
+         "is_authenticated",
+         "is_admin",
+         "auth_method",
++        "token_id",
+         "exp",
+         "token_use",
+         "permission_is_admin",
+@@ -6137,6 +6143,7 @@ class _StreamableHttpAuthHandler:
+ 
+             auth_user_ctx: dict[str, Any] = {
+                 "email": user_email,
++                "token_id": user_payload.get("jti"),
+                 "teams": final_teams,
+                 "is_authenticated": True,
+                 "is_admin": effective_is_admin,

@@ -63,6 +63,7 @@ const STRIPPED_INBOUND_HEADERS = new Set([
   "x-forwarded-proto",
   "x-forwarded-port",
   "x-real-ip",
+  "x-agentport-bridge",
 ]);
 
 function stripInboundHeaders(
@@ -71,7 +72,8 @@ function stripInboundHeaders(
   const authHeaderKey = config.contextforgeAuthHeaderName.toLowerCase();
   const result: Record<string, string | string[] | undefined> = {};
   for (const [key, value] of Object.entries(headers)) {
-    if (STRIPPED_INBOUND_HEADERS.has(key) || key === authHeaderKey) continue;
+    if (STRIPPED_INBOUND_HEADERS.has(key) || key === authHeaderKey || key.startsWith("x-aog-") || key.startsWith("x-agentport-"))
+      continue;
     result[key] = value;
   }
   return result;
@@ -85,6 +87,7 @@ function stripInboundHeaders(
 // /api/* path so every hop stays behind the BFF.
 function rewriteUpstreamLocation(
   headers: Record<string, string | string[] | undefined>,
+  upstreamOrigin: string,
 ): typeof headers {
   // Drop upstream Set-Cookie unconditionally — mcpgateway's own jwt_token
   // cookie must never reach the browser; the BFF session cookie is the only
@@ -93,10 +96,10 @@ function rewriteUpstreamLocation(
   const { "set-cookie": _dropped, ...rest } = headers;
 
   const location = rest.location;
-  if (typeof location !== "string" || !location.startsWith(config.contextforgeUrl)) {
+  if (typeof location !== "string" || !location.startsWith(upstreamOrigin)) {
     return rest;
   }
-  const upstreamPath = location.slice(config.contextforgeUrl.length);
+  const upstreamPath = location.slice(upstreamOrigin.length);
   return { ...rest, location: toBrowserPath(upstreamPath) };
 }
 
@@ -112,7 +115,9 @@ function csrfIfUnsafe(
 }
 
 export default async function catchAllProxyRoute(fastify: FastifyInstance): Promise<void> {
-  await fastify.register(replyFrom, { base: config.contextforgeUrl });
+  // No fixed base: reply-from pins its HTTP dispatcher to that origin even
+  // when getUpstream chooses another URL. Destinations below are config-owned.
+  await fastify.register(replyFrom);
 
   // Fastify's default JSON parser throws FST_ERR_CTP_EMPTY_JSON_BODY on an
   // empty body with Content-Type: application/json — before preHandler, so
@@ -148,11 +153,16 @@ export default async function catchAllProxyRoute(fastify: FastifyInstance): Prom
       // Wildcard capture excludes the leading '/api/'; see toUpstreamPath.
       const wildcard = (request.params as Record<string, string>)["*"] ?? "";
       const upstreamPath = toUpstreamPath(wildcard);
+      const isCore = wildcard === "orchestration/v1" || wildcard.startsWith("orchestration/v1/");
+      const upstreamOrigin = (isCore ? config.agentportCoreUrl : config.contextforgeUrl).replace(
+        /\/+$/,
+        "",
+      );
       const bearerToken = request.session!.bearerToken;
 
       const sessionId = request.session!.sessionId;
 
-      return reply.from(upstreamPath, {
+      return reply.from(`${upstreamOrigin}${upstreamPath}`, {
         rewriteRequestHeaders: (_req, headers) => {
           // See STRIPPED_INBOUND_HEADERS above — drop every inbound
           // infra/auth header before injecting the BFF-owned bearer and IP
@@ -160,13 +170,15 @@ export default async function catchAllProxyRoute(fastify: FastifyInstance): Prom
           const forwarded = stripInboundHeaders(headers);
           return {
             ...forwarded,
-            ...upstreamAuthHeader(bearerToken),
+            ...(isCore
+              ? { authorization: `Bearer ${bearerToken}` }
+              : upstreamAuthHeader(bearerToken)),
             // Preserve real client IP for upstream audit logging.
             "x-forwarded-for": request.ip,
             "x-real-ip": request.ip,
           };
         },
-        rewriteHeaders: rewriteUpstreamLocation,
+        rewriteHeaders: (headers) => rewriteUpstreamLocation(headers, upstreamOrigin),
         onResponse: (req, res, upstreamResponse) => {
           // 401 from upstream means the bearer token itself is dead
           // (expired/invalid) — not a permissions problem (that's 403,

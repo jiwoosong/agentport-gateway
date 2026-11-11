@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "project": "agentport-gateway",
+  "gateway": {
+    "repository": "https://github.com/IBM/mcp-context-forge",
+    "version": "1.1.0",
+    "commit": "aee91ff6db63b6aafa77522684a9483c418bb2a3",
+    "license": "Apache-2.0",
+    "integration": "separate optional compatibility component; required by the default backend",
+    "manifest": "integrations/contextforge/manifest.json",
+    "source_preparation": "scripts/prepare-contextforge.py",
+    "prepared_directory": "upstream/contextforge (ignored; not shipped in repository)",
+    "patch_record": "docs/upstream-contextforge.md",
+    "image": "agentport-contextforge:1.1.0-1",
+    "bridge_contract": 1,
+    "aog_schema": 2,
+    "stock_plugin": false
+  },
+  "dashboard": {
+    "repository": "https://github.com/contextforge-org/contextforge-web-ui",
+    "tag": "v0.2.4",
+    "commit": "3ab7b7253b379b2afa5ad65b4d4150aa84ab7559",
+    "license": "Apache-2.0",
+    "directory": "dashboard",
+    "integration": "modified source copy",
+    "patch_record": "docs/reuse-and-compatibility.md"
+  },
+  "lockfiles": [
+    "uv.lock",
+    "dashboard/package-lock.json",
+    "dashboard/server/package-lock.json",
+    "workers/acp/package-lock.json"
+  ],
+  "design_references_without_copied_code": [
+    {
+      "repository": "https://github.com/windmill-labs/windmill",
+      "commit": "f9a797281218d331cc0898fbca87e155959f5ae0",
+      "scope": "workflow and operations UX review only"
+    }
+  ]
+}

@@ -81,6 +81,21 @@ def test_runs_remain_private_even_when_definition_shared(store, alice):
         store.run("run-a", Principal(subject="bob@example.com", teams=["project-a"]))
 
 
+def test_public_only_api_token_cannot_read_its_owners_private_core_data(store, alice):
+    row = registered(store, alice)
+    queued(store, alice, row)
+    public_key = alice.model_copy(update={"token_use": "api", "teams": [], "team_scope_restricted": True,
+        "scopes": ["tools.read", "tools.execute"]})
+    assert store.list_resources(public_key, "service") == []
+    with pytest.raises(HTTPException):
+        store.resource(row.id, public_key)
+    with pytest.raises(HTTPException):
+        store.run("run-a", public_key)
+    with pytest.raises(HTTPException):
+        store.save("credential", {"name": "New private key"}, public_key)
+    assert store.resource(row.id, alice).id == row.id  # Normal interactive owner access remains.
+
+
 def test_delegated_agent_cannot_read_sibling_agent_output(store, alice):
     row = registered(store, alice)
     queued(store, alice, row)
@@ -303,3 +318,48 @@ async def test_stateful_failure_does_not_blindly_roll_back(store, alice):
     with pytest.raises(HTTPException):
         await Lifecycle(store, Deployment(), healthy).deploy_release(row, "v2", alice)
     assert store.phase(row.id) == "error"
+
+
+@pytest.mark.parametrize("existing_session_lock", [False, True])
+async def test_failed_agent_preparation_releases_only_the_lock_it_acquired(
+    store, alice, monkeypatch, existing_session_lock
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from aog.models import Agent
+
+    service = registered(store, alice, kind="agent", transport="acp")
+    profile = store.save("agent", Agent(name="Coder", service_id=service.id,
+        allowed_service_ids=[service.id]).model_dump(), alice)
+    session = store.save("session", {"name": "Existing session", "agent_id": profile.id,
+                                      "native_id": "native-session"}, alice)
+    with store.tx() as db:
+        db.add(Run(id="prepared-run", owner=alice.subject, principal=alice.model_dump(), inputs={},
+            spec={"local_only": True, "released": [], "snapshots": {
+                profile.id: {"kind": "agent", "revision": profile.revision, "document": profile.document},
+                service.id: {"kind": "service", "revision": service.revision, "document": service.document},
+            }}))
+        if existing_session_lock:
+            db.add(Lease(id=f"session:{session.id}", service_id=service.id, run_id="another-job"))
+
+    class Catalog:
+        async def resource(self, rid, actor, write=False):
+            return store.resource(rid, actor, "service", write=write)
+
+        async def invoke(self, *_):
+            pytest.fail("Preparation failure must precede external invocation")
+
+    issue = AsyncMock(side_effect=HTTPException(403, "Delegation rejected"))
+    application = Engine(store, permission_check=permit, catalog=Catalog(),
+        backend=SimpleNamespace(delegate=issue))
+    with pytest.raises(HTTPException) as error:
+        await application.call("prepared-run", "invoke", profile.id, {}, session.id)
+    assert error.value.status_code == (409 if existing_session_lock else 403)
+    with store.tx() as db:
+        locks = list(db.scalars(select(Lease)))
+        if existing_session_lock:
+            assert [(lock.id, lock.run_id) for lock in locks] == [(f"session:{session.id}", "another-job")]
+        else:
+            assert not locks
+    assert issue.await_count == (0 if existing_session_lock else 1)

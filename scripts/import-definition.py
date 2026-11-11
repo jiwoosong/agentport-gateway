@@ -9,7 +9,7 @@ import httpx
 import yaml
 
 parser = argparse.ArgumentParser()
-parser.add_argument("collection", choices=["services", "agents", "workflows"])
+parser.add_argument("collection", choices=["services", "agents", "workflows", "runtimes", "providers"])
 parser.add_argument("file", type=Path)
 parser.add_argument("--gateway", default="http://127.0.0.1:4444")
 args = parser.parse_args()

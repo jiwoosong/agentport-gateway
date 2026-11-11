@@ -15,13 +15,16 @@ import time
 from pathlib import Path
 
 import httpx
-import jwt
 import pytest
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AOG_INTEGRATION") != "1", reason="Opt-in real HTTP integration"
 )
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def integration_password():
+    return "Aa1!" + "".join(secrets.choice("eJqVxZ") + secrets.choice("279") + secrets.choice("!#") for _ in range(10))
 
 
 def port():
@@ -55,14 +58,13 @@ def poll(client, rid, status="completed"):
 
 
 def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
-    gateway_port, service_port = port(), port()
-    password = "Aa1!" + secrets.token_urlsafe(24)
+    gateway_port, core_port, service_port = port(), port(), port()
+    password = integration_password()
     env = {
         **os.environ,
-        "PYTHONPATH": str(ROOT / "src") + os.pathsep + str(ROOT),
+        "PYTHONPATH": os.pathsep.join((str(ROOT / "src"), str(ROOT / "upstream/contextforge"), str(ROOT))),
         "JWT_SECRET_KEY": secrets.token_urlsafe(48),
         "AUTH_ENCRYPTION_SECRET": secrets.token_urlsafe(48),
-        "AOG_DELEGATION_SECRET": secrets.token_urlsafe(48),
         "PLATFORM_ADMIN_EMAIL": "admin@example.com",
         "PLATFORM_ADMIN_PASSWORD": password,
         "DEFAULT_USER_PASSWORD": password,
@@ -77,6 +79,12 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
         "DBOS_SYSTEM_DATABASE_URL": f"sqlite:///{tmp_path}/dbos.db",
         "LOG_LEVEL": "ERROR",
         "PASSWORD_CHANGE_ENFORCEMENT_ENABLED": "false",
+        "SSRF_ALLOW_LOCALHOST": "true",
+        "SSRF_ALLOW_PRIVATE_NETWORKS": "true",
+        "AOG_INTERNAL_GATEWAY_URL": f"http://127.0.0.1:{gateway_port}",
+        "AOG_GATEWAY_URL": f"http://127.0.0.1:{gateway_port}",
+        "AOG_CORE_URL": f"http://127.0.0.1:{core_port}",
+        "AOG_GATEWAY_BRIDGE_SECRET": secrets.token_urlsafe(48),
     }  # Disposable test accounts only.
     gateway_log = (tmp_path / "gateway.log").open("w+")
     processes = []
@@ -87,7 +95,7 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
                     sys.executable,
                     "-m",
                     "uvicorn",
-                    "aog.app:app",
+                    "aog.integrations.contextforge.app:app",
                     "--port",
                     str(gateway_port),
                     "--log-level",
@@ -119,6 +127,11 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
         )
         client = httpx.Client(base_url=f"http://127.0.0.1:{gateway_port}", timeout=15, trust_env=False)
         wait(client)
+        processes.append(subprocess.Popen([sys.executable, "-m", "uvicorn", "aog.app:app",
+            "--port", str(core_port), "--log-level", "warning"], cwd=tmp_path, env=env,
+            stdout=gateway_log, stderr=gateway_log))
+        with httpx.Client(base_url=f"http://127.0.0.1:{core_port}", trust_env=False) as core:
+            wait(core)
         with httpx.Client(base_url=f"http://127.0.0.1:{service_port}", trust_env=False) as c:
             wait(c)
         login = client.post("/auth/email/login", json={"email": "admin@example.com", "password": password})
@@ -179,17 +192,17 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
         poll(client, rid, "waiting_approval")
         with httpx.Client(trust_env=False) as probe:
             before_restart = probe.get(f"http://127.0.0.1:{service_port}/health").json()["invocations"]
-        # Kill the gateway while waiting for approval; durable completed steps must not replay.
-        processes[0].kill()
-        processes[0].wait()
-        processes[0] = subprocess.Popen(
+        # Restart Core while ContextForge remains available; completed work must not replay.
+        processes[2].kill()
+        processes[2].wait()
+        processes[2] = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
                 "uvicorn",
                 "aog.app:app",
                 "--port",
-                str(gateway_port),
+                str(core_port),
                 "--log-level",
                 "warning",
             ],
@@ -198,7 +211,8 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
             stdout=gateway_log,
             stderr=gateway_log,
         )
-        wait(client)
+        with httpx.Client(base_url=f"http://127.0.0.1:{core_port}", trust_env=False) as core:
+            wait(core)
         poll(client, rid, "waiting_approval")
         assert (
             client.post(
@@ -270,10 +284,13 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
             json={"inputs": {"public": "cancel"}, "local_only": False},
         ).json()["id"]
         poll(client, cancelled_run, "waiting_approval")
-        runtime = client.post(
+        runtime_response = client.post(
             "/orchestration/v1/services",
-            json={**definition, "name": "ACP contract only", "kind": "agent", "transport": "acp"},
-        ).json()["id"]
+            json={**definition, "name": "ACP contract only", "kind": "agent", "transport": "acp",
+                  "endpoint": f"http://127.0.0.1:{service_port}/invoke"},
+        )
+        assert runtime_response.status_code == 201, runtime_response.text
+        runtime = runtime_response.json()["id"]
         delegated_agent = client.post(
             "/orchestration/v1/agents",
             json={
@@ -283,23 +300,52 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
                 "max_tool_calls": 1,
             },
         ).json()["id"]
-        grant = jwt.encode(
-            {
-                "iss": "agentport",
-                "aud": "agentport-mcp",
-                "exp": int(time.time()) + 120,
-                "principal": {
-                    **me.json(),
-                    "is_admin": False,
-                    "agent_id": delegated_agent,
-                    "parent_run_id": cancelled_run,
-                    "allowed_service_ids": [sid],
-                    "scopes": ["tools.read", "tools.execute"],
-                },
-            },
-            env["AOG_DELEGATION_SECRET"],
-            algorithm="HS256",
+        # Issue a real native token from the trusted job controller, not a handcrafted MCP token.
+        native_issue = r"""
+import asyncio, json, sys
+from aog.integrations.contextforge.delegation import issue
+from aog.models import Principal
+from aog.store import Store
+from mcpgateway.db import SessionLocal
+from mcpgateway.schemas import ServerCreate
+from mcpgateway.services.server_service import ServerService
+payload=json.load(sys.stdin)
+async def main():
+    handoff=await issue(payload['agent_id'],[payload['service_id']],payload['run_id'],
+        Principal.model_validate(payload['actor']),120,Store(payload['store_url']))
+    with SessionLocal() as db:
+        other=await ServerService().register_server(db,
+            ServerCreate(name='other_scope', associated_tools=[payload['cloud_id']]),
+            owner_email=payload['actor']['subject'], created_by=payload['actor']['subject'], visibility='private')
+    handoff['other_server_id']=other.id
+    print(json.dumps(handoff))
+asyncio.run(main())
+"""
+        issued = subprocess.run(
+            [sys.executable, "-c", native_issue], cwd=tmp_path, env=env, capture_output=True,
+            input=json.dumps({"agent_id": delegated_agent, "service_id": sid, "run_id": cancelled_run,
+                             "cloud_id": cloud, "actor": me.json(), "store_url": env["AOG_DATABASE_URL"]}),
+            text=True, timeout=30,
         )
+        assert issued.returncode == 0, issued.stderr[-5000:]
+        handoff = json.loads(issued.stdout.splitlines()[-1])
+        grant = handoff["gateway_token"]
+        native_service = client.get(f"/v1/tools/{sid}")
+        assert native_service.status_code == 200, native_service.text
+        service_name = native_service.json()["name"]
+        backend_id = native_service.json()["extensionMetadata"]["io.agentport/service"]["backend_tool_id"]
+        backend_response = client.get(f"/v1/tools/{backend_id}")
+        assert backend_response.status_code == 200, backend_response.text
+        with httpx.Client(base_url=f"http://127.0.0.1:{service_port}", trust_env=False) as converter:
+            before_direct = converter.get("/health").json()["invocations"]
+            direct = client.post("/rpc", json={"jsonrpc": "2.0", "id": 51, "method": "tools/call",
+                "params": {"name": backend_response.json()["name"], "arguments": {"text": "must not execute"}}})
+            assert direct.status_code in {200, 403}, direct.text
+            if direct.status_code == 200:
+                assert "error" in direct.json() or direct.json().get("result", {}).get("isError"), direct.text
+            assert converter.get("/health").json()["invocations"] == before_direct
+        cloud_name = client.get(f"/v1/tools/{cloud}").json()["name"]
+        get_run_name = client.get(f"/v1/tools/{me.json()['mcp_tools']['get_run']}").json()["name"]
         with httpx.Client(
             base_url=client.base_url, headers={"Authorization": "Bearer " + grant}, trust_env=False
         ) as narrowed:
@@ -313,34 +359,20 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
                 headers={"Authorization": "Bearer " + grant}, trust_env=False
             ) as http:
                 async with streamable_http_client(
-                    f"http://127.0.0.1:{gateway_port}/orchestration/v1/mcp/", http_client=http
+                    handoff["gateway_mcp_url"], http_client=http
                 ) as streams:
                     async with ClientSession(streams[0], streams[1]) as session:
                         await session.initialize()
-                        catalog = await session.call_tool("list_capabilities", {})
-                        assert not catalog.is_error
-                        catalog_data = catalog.structured_content or json.loads(catalog.content[0].text)
-                        assert [s["id"] for s in catalog_data["service"]] == [sid]
-                        assert (await session.call_tool("get_run", {"run_id": cancelled_run})).is_error
-                        assert (
-                            await session.call_tool(
-                                "invoke", {"kind": "service", "resource_id": cloud, "inputs": {}}
-                            )
-                        ).is_error
-                        args = {
-                            "kind": "service",
-                            "resource_id": sid,
-                            "inputs": {"text": "delegated"},
-                            "idempotency_key": "scoped-tool",
-                        }
-                        accepted = await session.call_tool("invoke", args)
+                        catalog = await session.list_tools()
+                        assert {tool.name for tool in catalog.tools} == {service_name, get_run_name}
+                        assert (await session.call_tool(get_run_name, {"run_id": cancelled_run})).is_error
+                        assert (await session.call_tool(cloud_name, {"inputs": {"text": "outside grant"}})).is_error
+                        args = {"inputs": {"text": "delegated"}, "idempotency_key": "scoped-tool"}
+                        accepted = await session.call_tool(service_name, args)
                         assert not accepted.is_error, accepted
-                        assert not (
-                            await session.call_tool("invoke", args)
-                        ).is_error  # Retry does not consume another budget slot.
-                        assert (
-                            await session.call_tool("invoke", {**args, "idempotency_key": "over-budget"})
-                        ).is_error
+                        assert not (await session.call_tool(service_name, args)).is_error
+                        assert (await session.call_tool(service_name,
+                            {**args, "idempotency_key": "over-budget"})).is_error
                         return (accepted.structured_content or json.loads(accepted.content[0].text))["id"]
 
         delegated_run = asyncio.run(delegated_mcp_check())
@@ -366,6 +398,25 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
             trust_env=False,
         )
         assert other.get("/orchestration/v1/services").json() == []
+        assert other.get("/v1/tools").status_code == 200
+        assert other.get(f"/v1/tools/{sid}").status_code in {403, 404}
+        assert other.get(f"/v1/tools/{backend_id}").status_code in {403, 404}
+        handshake = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "scope-regression", "version": "1"}}}
+        protocol_headers = {"Accept": "application/json, text/event-stream"}
+        assert other.post(handoff["gateway_mcp_url"], json=handshake,
+                          headers=protocol_headers).status_code in {403, 404}
+        with httpx.Client(base_url=client.base_url, headers={"Authorization": "Bearer " + grant}, trust_env=False) as scoped:
+            assert scoped.post(f"/servers/{handoff['other_server_id']}/mcp", json=handshake,
+                               headers=protocol_headers).status_code in {403, 404}
+            assert scoped.get(f"/v1/tools/{backend_id}").status_code == 403
+        local_registration = {"tool": {"name": "unauthorized_local", "integration_type": "AGENTPORT_LOCAL",
+            "request_type": "POST", "extensionMetadata": {"io.agentport/local": {"operation": "invoke"}}}}
+        assert other.post("/v1/tools", json=local_registration).status_code == 403
+        with httpx.Client(base_url=client.base_url, trust_env=False) as anonymous:
+            assert anonymous.post("/rpc", json={"jsonrpc": "2.0", "id": 1,
+                "method": "tools/call", "params": {"name": service_name, "arguments": {"inputs": {"text": "denied"}}}}).status_code == 401
         assert other.get(f"/orchestration/v1/runs/{run_id}").status_code == 404
         assert other.post(f"/orchestration/v1/services/{sid}/invoke", json={}).status_code in {403, 404}
         artifact = client.post(
@@ -375,6 +426,8 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
         assert other.post("/orchestration/v1/services", json=definition).status_code == 403
         # New runtime APIs must retain the existing admin boundary.
         sandbox_definition = json.loads((ROOT / "examples/openshell-agent.service.json").read_text())
+        sandbox_definition.update(endpoint=f"http://127.0.0.1:{service_port}/invoke",
+                                  health_url=f"http://127.0.0.1:{service_port}/health")
         sandbox_response = client.post("/orchestration/v1/services", json=sandbox_definition)
         assert sandbox_response.status_code == 201, sandbox_response.text
         sandbox_id = sandbox_response.json()["id"]
@@ -402,12 +455,12 @@ def test_real_gateway_login_workflow_isolation_and_mcp(tmp_path):
                 headers={"Authorization": "Bearer " + token}, trust_env=False
             ) as http:
                 async with streamable_http_client(
-                    f"http://127.0.0.1:{gateway_port}/orchestration/v1/mcp/", http_client=http
+                    f"http://127.0.0.1:{gateway_port}/mcp", http_client=http
                 ) as streams:
                     async with ClientSession(streams[0], streams[1]) as session:
                         await session.initialize()
-                        result = await session.call_tool("list_capabilities", {})
-                        assert not result.is_error, result
+                        result = await session.list_tools()
+                        assert service_name in {tool.name for tool in result.tools}
 
         asyncio.run(mcp_check())
         print(

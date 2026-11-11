@@ -1,6 +1,10 @@
 {$AGENTPORT_HOST:localhost} {
   tls internal
-  @mcp path /orchestration/v1/mcp*
+  @core path /orchestration/v1 /orchestration/v1/*
+  handle @core {
+    reverse_proxy core:4455
+  }
+  @mcp path /mcp /mcp/* /servers/*/mcp /servers/*/mcp/* /rpc /servers/*/rpc /.well-known/* /oauth/*
   handle @mcp {
     reverse_proxy gateway:4444
   }

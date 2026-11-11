@@ -1,5 +1,7 @@
 # Competitive Landscape
 
+> 이 문서는 당시 조사·변경의 기록입니다. 현재 구성·지원 범위·호출 경로는 [Architecture](architecture.md), [Integrations](integrations.md), [Validation](validation.md)을 기준으로 합니다.
+
 조사일: 2026-11-10. AgentPort 기준: `5f27f60`. 아래 비교는 공식 저장소·문서와 현재 AgentPort 코드·검증 기록을 대조한 결과입니다. 경쟁 제품을 직접 설치해 비교한 성능·사용성 시험은 아닙니다. 공식 문서에 없다는 이유만으로 기능이 없다고 판정하지 않습니다. 개발 브랜치의 설명과 실제 릴리스·배포판의 지원 범위도 다를 수 있습니다.
 
 ## Assessment

@@ -6,6 +6,13 @@ import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
 import { GraphEditor } from "./orchestration/GraphEditor";
 import { InvokeForm } from "./orchestration/InvokeForm";
+import { binaryArtifact, downloadBinaryArtifact, resultSummary } from "./orchestration/results";
+import {
+  AgentProfileForm,
+  ProviderForm,
+  RuntimeForm,
+  ServiceForm,
+} from "./orchestration/RuntimeForms";
 import {
   base,
   box,
@@ -16,6 +23,8 @@ import {
   type Json,
   type Run,
   type Session,
+  type Credential,
+  type Harness,
 } from "./orchestration/shared";
 
 function download(name: string, value: unknown, plain = false) {
@@ -29,6 +38,43 @@ function download(name: string, value: unknown, plain = false) {
   a.download = name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function DefinitionImport({
+  kind,
+  busy,
+  onImport,
+}: {
+  kind: "service" | "runtime";
+  busy: boolean;
+  onImport: (load: () => Promise<unknown>) => Promise<void>;
+}) {
+  return (
+    <label className="block text-sm">
+      Import {kind} definition
+      <Input
+        type="file"
+        accept=".json,application/json"
+        disabled={busy}
+        onChange={(event) => {
+          const input = event.currentTarget;
+          const file = input.files?.[0];
+          if (!file) return;
+          void onImport(async () => {
+            if (file.size > 1024 * 1024) throw new Error("Maximum definition size is 1 MiB");
+            const value = JSON.parse(await file.text());
+            if (!value || typeof value !== "object" || Array.isArray(value))
+              throw new Error("Choose a JSON definition object");
+            if (value.definition && value.kind && value.kind !== kind)
+              throw new Error(`Choose a ${kind} definition`);
+            const definition = value.definition || value;
+            await api.post(`${base}/${kind}s`, definition);
+            input.value = "";
+          });
+        }}
+      />
+    </label>
+  );
 }
 
 export function Orchestration() {
@@ -46,43 +92,28 @@ export function Orchestration() {
   const [editor, setEditor] = useState<Entity | "new" | null>(null);
   const [register, setRegister] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [registration, setRegistration] = useState(
-    serialize({
-      schema_version: 1,
-      name: "New service",
-      kind: "tool",
-      transport: "http",
-      endpoint: "http://converter:8080/convert",
-      lifecycle: "manual",
-      egress_policy: "isolated",
-      input_schema: {
-        type: "object",
-        properties: { text: { type: "string" } },
-        required: ["text"],
-      },
-    }),
-  );
-  const [agentName, setAgentName] = useState("");
-  const [agentService, setAgentService] = useState("");
-  const [persona, setPersona] = useState("");
-  const [credentials, setCredentials] = useState<{ id: string; name: string }[]>([]);
-  const [credentialRef, setCredentialRef] = useState("");
+  const [runtimes, setRuntimes] = useState<Entity[]>([]);
+  const [providers, setProviders] = useState<Entity[]>([]);
+  const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  const [credentials, setCredentials] = useState<Credential[]>([]);
   const [secretName, setSecretName] = useState("");
   const [secretToken, setSecretToken] = useState("");
-  const [editingService, setEditingService] = useState<string | null>(null);
-  const [model, setModel] = useState("");
-  const [allowedTools, setAllowedTools] = useState<string[]>([]);
-  const [toolBudget, setToolBudget] = useState(20);
+  const [editingService, setEditingService] = useState<Entity | null>(null);
+  const [runtimeEditor, setRuntimeEditor] = useState<Entity | "new" | null>(null);
+  const [providerEditor, setProviderEditor] = useState<Entity | "new" | null>(null);
 
   const refresh = useCallback(async () => {
-    const [s, a, w, r, me, ss, cs] = await Promise.all([
+    const [s, a, w, r, me, ss, cs, rs, ps, hs] = await Promise.all([
       api.get<Entity[]>(`${base}/services`),
       api.get<Entity[]>(`${base}/agents`),
       api.get<Entity[]>(`${base}/workflows`),
       api.get<Run[]>(`${base}/runs`),
       api.get<{ is_admin: boolean }>(`${base}/me`),
       api.get<Session[]>(`${base}/sessions`),
-      api.get<{ id: string; name: string }[]>(`${base}/credentials`),
+      api.get<Credential[]>(`${base}/credentials`),
+      api.get<Entity[]>(`${base}/runtimes`),
+      api.get<Entity[]>(`${base}/providers`),
+      api.get<Harness[]>(`${base}/harnesses`),
     ]);
     setServices(s);
     setAgents(a);
@@ -91,6 +122,9 @@ export function Orchestration() {
     setAdmin(me.is_admin);
     setSessions(ss);
     setCredentials(cs);
+    setRuntimes(rs);
+    setProviders(ps);
+    setHarnesses(hs);
   }, []);
   useEffect(() => {
     void refresh().catch((e) => setError(errorText(e)));
@@ -147,6 +181,8 @@ export function Orchestration() {
           ["services", "Services"],
           ["agents", "Agents & sessions"],
           ["workflows", "Workflows"],
+          ["runtimes", "Runtimes"],
+          ["providers", "Providers"],
           ["runs", "Activity"],
         ].map(([id, label]) => (
           <Button
@@ -189,33 +225,22 @@ export function Orchestration() {
               </Button>
             )}
           </div>
+          {admin && <DefinitionImport kind="service" busy={busy} onImport={action} />}
           {register && (
-            <form
-              className={box}
-              onSubmit={(e) => {
-                e.preventDefault();
-                void action(async () => {
+            <ServiceForm
+              key={editingService?.id || "new"}
+              runtimes={runtimes}
+              initial={editingService}
+              busy={busy}
+              onSave={(definition) =>
+                action(async () => {
                   if (editingService)
-                    await api.put(`${base}/services/${editingService}`, JSON.parse(registration));
-                  else await api.post(`${base}/services`, JSON.parse(registration));
+                    await api.put(`${base}/services/${editingService.id}`, definition);
+                  else await api.post(`${base}/services`, definition);
                   setRegister(false);
-                });
-              }}
-            >
-              <label className="block text-sm font-medium">
-                Service definition
-                <Textarea
-                  className="mt-2 min-h-64 font-mono"
-                  value={registration}
-                  onChange={(e) => setRegistration(e.target.value)}
-                />
-              </label>
-              <p className="my-3 text-xs text-muted-foreground">
-                Operator only. Mark a service isolated only after its deployment blocks external
-                egress.
-              </p>
-              <Button disabled={busy}>{editingService ? "Save definition" : "Register"}</Button>
-            </form>
+                })
+              }
+            />
           )}
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {services.map((s) => (
@@ -246,8 +271,7 @@ export function Orchestration() {
                           const value = await api.get<{ definition: Json }>(
                             `${base}/services/${s.id}/export`,
                           );
-                          setRegistration(serialize(value.definition));
-                          setEditingService(s.id);
+                          setEditingService({ ...value.definition, id: s.id } as Entity);
                           setRegister(true);
                         }, "Editing service definition")
                       }
@@ -339,140 +363,15 @@ export function Orchestration() {
       {tab === "agents" && (
         <>
           <h2 className="text-xl font-semibold">Agents & sessions</h2>
-          <details className={box}>
-            <summary className="cursor-pointer text-sm font-medium">
-              Personal provider credentials
-            </summary>
-            <form
-              className="mt-3 flex flex-wrap gap-3"
-              onSubmit={(e) => {
-                e.preventDefault();
-                void action(async () => {
-                  const value = await api.post<{ id: string }>(`${base}/credentials`, {
-                    name: secretName,
-                    token: secretToken,
-                  });
-                  setCredentialRef(value.id);
-                  setSecretToken("");
-                  setSecretName("");
-                }, "Credential stored. The value cannot be read back.");
-              }}
-            >
-              <Input
-                aria-label="Credential name"
-                placeholder="Name"
-                value={secretName}
-                onChange={(e) => setSecretName(e.target.value)}
-                required
-              />
-              <Input
-                aria-label="Provider API key"
-                type="password"
-                autoComplete="off"
-                value={secretToken}
-                onChange={(e) => setSecretToken(e.target.value)}
-                required
-              />
-              <Button disabled={busy}>Save personal credential</Button>
-            </form>
-          </details>
-          <form
-            className={box + " grid gap-3 md:grid-cols-2"}
-            onSubmit={(e) => {
-              e.preventDefault();
-              void action(() =>
-                api.post(`${base}/agents`, {
-                  name: agentName,
-                  service_id: agentService,
-                  credential_ref: credentialRef || null,
-                  persona,
-                  model: model || null,
-                  allowed_service_ids: allowedTools,
-                  max_tool_calls: toolBudget,
-                }),
-              );
-            }}
-          >
-            <label className="text-sm">
-              Name
-              <Input required value={agentName} onChange={(e) => setAgentName(e.target.value)} />
-            </label>
-            <label className="text-sm">
-              Runtime
-              <select
-                required
-                className={selectClass}
-                value={agentService}
-                onChange={(e) => setAgentService(e.target.value)}
-              >
-                <option value="">Select an authorized runtime</option>
-                {services
-                  .filter((s) => s.kind === "agent")
-                  .map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            <label className="text-sm md:col-span-2">
-              Persona (optional)
-              <Textarea value={persona} onChange={(e) => setPersona(e.target.value)} />
-            </label>
-            <label className="text-sm">
-              Model (optional)
-              <Input value={model} onChange={(e) => setModel(e.target.value)} />
-            </label>
-            <label className="text-sm">
-              Personal credential
-              <select
-                className={selectClass}
-                value={credentialRef}
-                onChange={(e) => setCredentialRef(e.target.value)}
-              >
-                <option value="">Worker-managed authentication</option>
-                {credentials.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="text-sm">
-              Tool-call budget
-              <Input
-                type="number"
-                min={0}
-                max={1000}
-                value={toolBudget}
-                onChange={(e) => setToolBudget(Number(e.target.value))}
-              />
-            </label>
-            <fieldset className="text-sm md:col-span-2">
-              <legend className="mb-2">Allowed gateway tools</legend>
-              {services
-                .filter((s) => s.kind !== "agent")
-                .map((s) => (
-                  <label key={s.id} className="mr-4 inline-flex gap-2">
-                    <input
-                      type="checkbox"
-                      checked={allowedTools.includes(s.id)}
-                      onChange={(e) =>
-                        setAllowedTools((v) =>
-                          e.target.checked ? [...v, s.id] : v.filter((id) => id !== s.id),
-                        )
-                      }
-                    />
-                    {s.name}
-                  </label>
-                ))}
-              <p className="mt-2 text-xs text-muted-foreground">
-                The gateway also checks your current permissions. Native harness tools stay inside
-                the worker container.
-              </p>
-            </fieldset>
-            <Button disabled={busy || !agentService}>Create agent</Button>
-          </form>
+          <AgentProfileForm
+            runtimes={runtimes}
+            providers={providers}
+            credentials={credentials}
+            harnesses={harnesses}
+            services={services}
+            busy={busy}
+            onSave={(definition) => action(() => api.post(`${base}/agents`, definition))}
+          />
           <div className="grid gap-4 md:grid-cols-2">
             {agents.map((a) => (
               <article key={a.id} className={box}>
@@ -481,6 +380,148 @@ export function Orchestration() {
                   {String(a.persona || "Native agent instructions")}
                 </p>
                 <Button onClick={() => setSelected(a)}>Start or resume work</Button>
+              </article>
+            ))}
+          </div>
+        </>
+      )}
+      {tab === "runtimes" && (
+        <>
+          <div className="flex justify-between">
+            <h2 className="text-xl font-semibold">Execution runtimes</h2>
+            {admin && (
+              <Button onClick={() => setRuntimeEditor(runtimeEditor ? null : "new")}>
+                New runtime
+              </Button>
+            )}
+          </div>
+          {admin && <DefinitionImport kind="runtime" busy={busy} onImport={action} />}
+          {runtimeEditor && (
+            <RuntimeForm
+              key={typeof runtimeEditor === "string" ? "new" : runtimeEditor.id}
+              initial={runtimeEditor === "new" ? null : runtimeEditor}
+              busy={busy}
+              onSave={(definition) =>
+                action(async () => {
+                  if (runtimeEditor === "new") await api.post(`${base}/runtimes`, definition);
+                  else await api.put(`${base}/runtimes/${runtimeEditor.id}`, definition);
+                  setRuntimeEditor(null);
+                })
+              }
+            />
+          )}
+          <div className="grid gap-4 md:grid-cols-2">
+            {runtimes.map((r) => (
+              <article key={r.id} className={box + " space-y-3"}>
+                <h3 className="font-semibold">{r.name}</h3>
+                <p className="text-sm">
+                  {r.backend} · {r.lifecycle?.replace(/_/g, " ")} · {r.runtime_phase || "unknown"}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  Active jobs:{" "}
+                  {Array.isArray(r.active_jobs) ? r.active_jobs.length : Number(r.active_jobs || 0)}
+                </p>
+                {admin && (
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" onClick={() => setRuntimeEditor(r)}>
+                      Configure runtime
+                    </Button>
+                    {r.backend !== "external" &&
+                      (r.backend === "openshell"
+                        ? ["start", "stop"]
+                        : ["start", "stop", "update"]
+                      ).map((operation) => (
+                        <Button
+                          key={operation}
+                          variant="outline"
+                          disabled={busy}
+                          onClick={() =>
+                            void action(
+                              () =>
+                                api.post(`${base}/runtimes/${r.id}/operations/${operation}`, {}),
+                              `Runtime ${operation} completed`,
+                            )
+                          }
+                        >
+                          {operation}
+                        </Button>
+                      ))}
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+          {!runtimes.length && (
+            <p className={box}>
+              An operator can register an existing deployment and bind tools to it.
+            </p>
+          )}
+        </>
+      )}
+      {tab === "providers" && (
+        <>
+          <div className="flex justify-between">
+            <h2 className="text-xl font-semibold">Your provider connections</h2>
+            <Button onClick={() => setProviderEditor(providerEditor ? null : "new")}>
+              New provider connection
+            </Button>
+          </div>
+          <details className={box}>
+            <summary className="cursor-pointer text-sm font-medium">
+              Personal API credentials
+            </summary>
+            <form
+              className="mt-3 flex flex-wrap gap-3"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void action(async () => {
+                  await api.post(`${base}/credentials`, { name: secretName, token: secretToken });
+                  setSecretToken("");
+                  setSecretName("");
+                }, "Credential stored. The value cannot be read back.");
+              }}
+            >
+              <Input
+                aria-label="Credential name"
+                placeholder="Name"
+                required
+                value={secretName}
+                onChange={(e) => setSecretName(e.target.value)}
+              />
+              <Input
+                aria-label="Provider API key"
+                type="password"
+                autoComplete="off"
+                required
+                value={secretToken}
+                onChange={(e) => setSecretToken(e.target.value)}
+              />
+              <Button disabled={busy}>Save personal credential</Button>
+            </form>
+          </details>
+          {providerEditor && (
+            <ProviderForm
+              key={typeof providerEditor === "string" ? "new" : providerEditor.id}
+              initial={providerEditor === "new" ? null : providerEditor}
+              credentials={credentials}
+              busy={busy}
+              onSave={(definition) =>
+                action(async () => {
+                  if (providerEditor === "new") await api.post(`${base}/providers`, definition);
+                  else await api.put(`${base}/providers/${providerEditor.id}`, definition);
+                  setProviderEditor(null);
+                })
+              }
+            />
+          )}
+          <div className="grid gap-4 md:grid-cols-2">
+            {providers.map((p) => (
+              <article className={box + " space-y-3"} key={p.id}>
+                <h3 className="font-semibold">{p.name}</h3>
+                <p className="text-sm">{p.protocol}</p>
+                <Button variant="outline" onClick={() => setProviderEditor(p)}>
+                  Configure connection
+                </Button>
               </article>
             ))}
           </div>
@@ -609,6 +650,33 @@ export function Orchestration() {
                   Request cancellation
                 </Button>
               )}
+              {selectedRun.permissions?.map((permission) => (
+                <section className="rounded-lg border p-4 space-y-3" key={permission.id}>
+                  <h3 className="font-semibold">
+                    {permission.title || "Agent permission request"}
+                  </h3>
+                  <div className="flex flex-wrap gap-2">
+                    {permission.options.map((option) => (
+                      <Button
+                        key={option.option_id}
+                        disabled={busy}
+                        variant="outline"
+                        onClick={() =>
+                          void action(async () => {
+                            await api.post(
+                              `${base}/runs/${selectedRun.id}/permissions/${permission.id}`,
+                              { option_id: option.option_id },
+                            );
+                            setSelectedRun(await api.get<Run>(`${base}/runs/${selectedRun.id}`));
+                          }, "Permission decision recorded")
+                        }
+                      >
+                        {option.name}
+                      </Button>
+                    ))}
+                  </div>
+                </section>
+              ))}
               {selectedRun.steps?.map((s) => (
                 <section key={s.id} className="rounded-lg border p-4">
                   <div className="flex justify-between">
@@ -621,7 +689,9 @@ export function Orchestration() {
                       {s.status === "waiting_approval" ? "Payload to approve" : "Step details"}
                     </summary>
                     <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
-                      {serialize(s.output)}
+                      {s.status === "waiting_approval"
+                        ? serialize(s.output)
+                        : resultSummary(s.output)}
                     </pre>
                   </details>
                   {s.status === "waiting_approval" && (
@@ -670,7 +740,7 @@ export function Orchestration() {
                       Structured result
                     </summary>
                     <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted p-3 text-xs">
-                      {serialize(selectedRun.result)}
+                      {resultSummary(selectedRun.result)}
                     </pre>
                   </details>
                   <Button
@@ -682,6 +752,22 @@ export function Orchestration() {
               )}
               {selectedRun.result &&
                 Object.entries(selectedRun.result).map(([id, output]) => {
+                  const binary = binaryArtifact(output);
+                  if (binary)
+                    return (
+                      <Button
+                        key={id}
+                        variant="outline"
+                        onClick={() =>
+                          void action(
+                            async () => downloadBinaryArtifact(binary),
+                            "Result downloaded",
+                          )
+                        }
+                      >
+                        Download {binary.filename}
+                      </Button>
+                    );
                   const file = output as { filename?: string; text?: string } | null;
                   return file?.filename && typeof file.text === "string" ? (
                     <Button

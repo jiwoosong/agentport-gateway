@@ -46,11 +46,14 @@ export const config = {
   port: Number(optional("PORT", "3000")),
   host: optional("HOST", "0.0.0.0"),
 
-  // Upstream ContextForge API. All bearer-token traffic goes here,
+  // Native ContextForge API and login. Bearer-token traffic stays
   // server-to-server only — the browser never talks to this origin directly.
   // Not named after the upstream's current framework (FastAPI) since that's
   // an implementation detail ContextForge could change independently.
   contextforgeUrl: optional("CONTEXTFORGE_URL", "http://127.0.0.1:4444"),
+
+  // AgentPort job/runtime APIs run separately from the native gateway.
+  agentportCoreUrl: optional("AGENTPORT_CORE_URL", "http://127.0.0.1:4455"),
 
   // Header mcpgateway reads the bearer token from — must match its own AUTH_HEADER_NAME.
   contextforgeAuthHeaderName: optional("CONTEXTFORGE_AUTH_HEADER_NAME", "Authorization"),
@@ -147,6 +150,17 @@ export const config = {
 
   logLevel: optional("LOG_LEVEL", "info"),
 } as const;
+
+const coreUrl = new URL(config.agentportCoreUrl);
+if (
+  !["http:", "https:"].includes(coreUrl.protocol) ||
+  coreUrl.username ||
+  coreUrl.password ||
+  coreUrl.search ||
+  coreUrl.hash
+) {
+  throw new Error("AGENTPORT_CORE_URL must use HTTP(S) without credentials, query or fragment");
+}
 
 // NODE_ENV isn't reliably set by the start script, so also fail closed on COOKIE_SECURE=true (prod's default).
 if (

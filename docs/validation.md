@@ -1,4 +1,43 @@
-# 검증 기록
+# Validation
+
+## Separate Components Verification
+
+현재 구성은 Core와 gateway를 분리한 구조입니다. 아래 단일 앱 재구성·과거 측정 결과를 새 구성의 종단 간 검증으로 합산하지 않습니다.
+
+- Python 3.13.18 전체 회귀: **242 passed**, 38.54초. 두 프로세스 HTTP/MCP·두 사용자 격리·Core 강제 종료 복구·실제 ACP 테스트 프로세스·승인/취소/불명확 작업 정리·이전·설정 변경 잠금·서명 bridge·토큰 IP/시간/사용량 제한을 포함합니다. schema2의 Responses 연결·native 로그인과 빈 팀 범위의 비공개 Core 데이터 차단도 포함합니다. 모델 공급자의 유료 추론은 사용하지 않았습니다.
+- 준비 스크립트로 재현한 gateway의 선택 상류 회귀: **852 passed, 9 skipped**, 14.93초. RBAC·권한 축소·토큰 카탈로그·도구·bootstrap 대상입니다.
+- Core는 Python 3.13과 3.14 모두에서 upstream 소스와 `mcpgateway` 패키지가 없는 상태로 frozen 설치·앱 import를 통과했습니다. 설치된 다른 gateway entry point를 선택하는 검사도 포함합니다.
+- ContextForge가 설치되지 않은 Python 3.14 Core 환경의 선택 회귀는 **36 passed, 1 skipped**입니다.
+
+- BFF proxy/config 집중 검증: 41 passed. Core 전용 경로 분기·native API 유지·Bearer/CSRF·redirect·내부 header 차단. 전체 BFF 회귀는 26개 파일·291 tests passed, TypeScript build 통과.
+- Compose: demo/image-demo/managed/https 및 Core용 OpenShell override config 통과. 초기화의 private bridge key·.env0600·기존 값 보존과 Core에 native JWT/encryption master가 없는 구성도 확인.
+- 실제 Docker 실행은 이 환경의 daemon 접근 제한으로 별도 검증이 필요합니다. Compose config와 source preparation 검증은 container build/run과 구분합니다.
+
+로컬 vLLM 검증은 운영자가 서비스 업데이트를 위해 중지한 상태여서 보류했습니다. 실기·공급자 추론·업데이트 복원을 이 자동 테스트 결과에 포함하지 않습니다. Python schema sandbox fork 및 상류 ToolPreInvokePayload header의 deprecation 경고가 남습니다.
+
+## 2026-11-11 Native Gateway Rebuild Before Component Split
+
+아래는 이번 구조의 검증 범위입니다. 뒤의 2026-11-09/10 결과·스크린샷·메모리/기동 측정은 **이전 코드의 이력**이며 현재 포크의 성능 수치나 전체 회귀 결과로 사용하지 않습니다.
+
+| 검증 | 결과와 범위 |
+|---|---|
+| ContextForge 포크 원본 회귀 선택 실행 | 852 passed, 9 skipped. native RBAC·TokenCatalog·ToolService·bootstrap. upstream 전체 테스트라는 뜻은 아님 |
+| AgentPort 서버 회귀 | 68 passed, 2 skipped 시점의 결과. native catalog·내부 backend guard·위임 범위·공유 runtime·provider/profile·worker job/승인/취소·이미지 계약 포함. 후속 추가 회귀는 별도 기록 |
+| 실제 native HTTP 통합 | 로그인·두 사용자 격리·native MCP/REST 도구·process restart·완료 결과 재사용 경로 통과. 모델·원격 장치 대신 로컬 stand-in 사용 |
+| 이미지 예제 | 4 passed. PNG/JPEG → WebP bytes/hash, 잘못된 입력·크기·decoded pixel 제한, EXIF 방향과 metadata 제외 |
+| AgentPort UI 집중 검증 | 13 passed, 3 files. runtime/provider/profile 폼·JSON definition import·파일 입력·native 승인·binary 결과 다운로드 |
+| Dashboard 전체 회귀 | 230 test files passed, 3,803 tests passed·1 skipped, 150.32초. 이번 코드의 전체 UI 회귀 결과 |
+| UI 빌드·정적 검사 | TypeScript·Vite production build, 변경한 AgentPort UI ESLint 통과. 기존 vendor chunk/Zod annotation 경고 유지 |
+| BFF | 287 passed, 26 files와 빌드 통과 |
+| Compose | image-demo config 검증. 현재 로컬 환경은 Docker daemon 접근 거부로 실제 이미지 build/run 미실행 |
+
+후속 집중 검증: session 준비 실패 시 소유 lease만 해제하고 기존 다른 작업의 lease는 보존하는 회귀, 삭제/비활성 API token의 queued principal 실행 거부를 포함한 contracts/native delegation 22개 통과. schema2 review snapshot·정확한 공개 입력·cloud worker 경계 6개, 설정 변경 claim 5개 및 기존 runtime 6개 통과.
+
+재시작 bootstrap이 owned private backend/control을 public으로 바꾸지 않는 경계를 보정하고, 반복 bootstrap 및 실제 프로세스 재시작으로 확인했습니다. native REST mutation의 자동 재시도는 끄고 응답 유실은 한 번의 외부 시도 이후 확인 대상으로 남깁니다. native MCP/RPC 경로가 lifecycle·승인 단계를 건너뛰지 않는 테스트를 포함합니다.
+
+실제 DGX Spark·원격 PC GPU·Komodo Periphery·OpenShell 인증/네트워크 정책·유료 Codex/Claude 추론·Kimi/OpenCode/Hermes binary·Relay native 이벤트는 이번 검증에 포함되지 않습니다. PostgreSQL 실제 복원과 schema 변경 rollback은 별도 리허설이 필요합니다. 테스트 template/모의 프로세스를 제품 실기 검증으로 표시하지 않습니다.
+
+## Historical Results
 
 초기 작업 환경: 2026-11-09, Linux amd64, Python 3.14.4, Node.js 24.22.2. 이 문서는 코드 구현, 모의 계약 검증, 실제 외부 통합 검증을 구분합니다. CI 결과가 환경별로 다르면 해당 실행 결과를 우선합니다.
 

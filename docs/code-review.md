@@ -1,5 +1,7 @@
 # 코드 검토와 리팩터링 기록
 
+> 이 문서는 당시 조사·변경의 기록입니다. 현재 구성·지원 범위·호출 경로는 [Architecture](architecture.md), [Integrations](integrations.md), [Validation](validation.md)을 기준으로 합니다.
+
 2026-11-10, 병합된 main `82ce187` 기준입니다. AgentPort 자체 코드의 인증 → API/MCP → 그래프 → 저장소·임대 → 실행 백엔드 → ACP 워커 → 결과 흐름과 대시보드, 배포·초기화 스크립트를 검토했습니다. 재사용 중인 BFF는 세션·CSRF·프록시 연결 경로를 확인했습니다. 상류 UI 전체에 대한 개별 코드 감사나 보안 인증을 의미하지 않습니다.
 
 ## 정리한 부분

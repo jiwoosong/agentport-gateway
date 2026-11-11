@@ -9,12 +9,12 @@ from typing import Literal
 from dbos import DBOS
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from aog.engine import current, digest
-from aog.models import Agent, Decision, Invocation, Principal, Resolution, Service, Workflow
+from aog.models import Agent, AgentProfile, Decision, Invocation, Principal, Resolution, Service, Workflow
 from aog.security import authenticate, authorize, require_admin
-from aog.store import Lease, Run, Runtime, Step
+from aog.store import Run, Step
 
 router = APIRouter(prefix="/orchestration/v1", tags=["AgentPort"])
 KINDS = {"services": ("service", Service), "agents": ("agent", Agent), "workflows": ("workflow", Workflow)}
@@ -51,19 +51,20 @@ def run_view(run):
 
 @router.get("/me")
 async def me(actor: Principal = Depends(reader)):
-    return actor
+    controls = {} if actor.public_only else await current().backend.controls(actor, current().store)
+    return {**actor.model_dump(), "mcp_tools": controls, "mcp_url": "/mcp"}
 
 
 @router.get("/worker-public-key")
 async def worker_public_key(actor: Principal = Depends(reader)):
     require_admin(actor)
-    from aog.identity import public_key_base64
-
-    return {"algorithm": "EdDSA", "public_key": public_key_base64()}
+    return await current().backend.worker_public_key()
 
 
 @router.get("/runs")
 async def runs(actor: Principal = Depends(reader)):
+    if actor.public_only:
+        return []
     with current().store.tx() as db:
         query = select(Run).order_by(Run.created_at.desc()).limit(100)
         if not actor.is_admin:
@@ -79,10 +80,38 @@ async def run_detail(run_id: str, actor: Principal = Depends(reader)):
             {"id": s.node_id, "status": s.status, "output": s.output}
             for s in db.scalars(select(Step).where(Step.run_id == run_id))
         ]
-    return {**run_view(run), "steps": steps}
+    permissions = [permission for step in steps
+        for permission in step["output"].get("worker", {}).get("permissions", [])]
+    permissions = [{**permission, "options": [
+        {"option_id": option.get("optionId", option.get("option_id")), "name": option["name"]}
+        for option in permission.get("options", [])]} for permission in permissions]
+    return {**run_view(run), "steps": steps, "permissions": permissions}
 
 
-@router.post("/runs/{run_id}/cancel")
+class NativePermission(BaseModel):
+    option_id: str
+
+
+async def native_permission(run_id: str, permission_id: str, value: NativePermission,
+    actor: Principal = Depends(operator)):
+    run = current().store.run(run_id, actor)
+    with current().store.tx() as db:
+        steps = list(db.scalars(select(Step).where(Step.run_id == run_id)))
+    for step in steps:
+        worker = step.output.get("worker", {})
+        if any(p["id"] == permission_id for p in worker.get("permissions", [])):
+            service_row = await current().resource(step.output["service_id"], actor, "service")
+            service = Service.model_validate(service_row.document)
+            response = await current().catalog.worker_control(service_row.id, service,
+                step.id, {**run.principal, "project_id": service_row.project_id},
+                {"operation": "approve", "job_id": worker["job_id"],
+                    "permission_id": permission_id, "option_id": value.option_id})
+            current().store.audit(actor.subject, "agent.permission", step.id,
+                {"permission_id": permission_id, "option_id": value.option_id})
+            return response
+    raise HTTPException(409, "The native permission request is no longer pending")
+
+
 async def cancel(run_id: str, actor: Principal = Depends(operator)):
     run = current().store.run(run_id, actor)
     if run.status in {"completed", "cancelled", "failed"}:
@@ -106,7 +135,6 @@ async def cancel(run_id: str, actor: Principal = Depends(operator)):
     }
 
 
-@router.post("/runs/{run_id}/steps/{node_id}/approve")
 async def approve(run_id: str, node_id: str, decision: Decision, actor: Principal = Depends(operator)):
     current().store.run(run_id, actor)
     step = current().store.step(run_id, node_id)
@@ -127,7 +155,6 @@ async def approve(run_id: str, node_id: str, decision: Decision, actor: Principa
     return {"accepted": True}
 
 
-@router.post("/runs/{run_id}/steps/{node_id}/resolve")
 async def resolve_step(
     run_id: str, node_id: str, resolution: Resolution, actor: Principal = Depends(operator)
 ):
@@ -144,6 +171,20 @@ async def resolve_step(
         or node_id.startswith(n["id"] + "-review-")
     ]
     parent = max(parents, key=len)
+    worker = step.output.get("worker", {})
+    if worker.get("job_id") and current().catalog:
+        service_row = await current().resource(step.output["service_id"], actor, "service")
+        service = Service.model_validate(service_row.document)
+        # The worker has a separate restart/session guard. Do not clear only the
+        # central lease while the native job remains unresolved.
+        worker_actor = {**run.principal, "project_id": service_row.project_id}
+        state = await current().catalog.worker_control(service_row.id, service, step.id,
+            worker_actor, {"operation": "status", "job_id": worker["job_id"]})
+        if state.get("status") not in {"completed", "cancelled", "failed"}:
+            await current().catalog.worker_control(service_row.id, service, step.id,
+                worker_actor,
+                {"operation": "resolve", "job_id": worker["job_id"], **resolution.model_dump()},
+                operator=True)
     current().store.release(step.id)
     if step.output.get("session_id"):
         current().store.release(f"session:{step.output['session_id']}")
@@ -156,6 +197,40 @@ async def resolve_step(
         idempotency_key=f"resolution:{run_id}:{node_id}",
     )
     return {"accepted": True}
+
+
+@router.post("/runs/{run_id}/permissions/{permission_id}")
+async def native_permission_route(run_id: str, permission_id: str, value: NativePermission,
+    actor: Principal = Depends(operator)):
+    if current().catalog:
+        return await current().catalog.control("agent_permission", {"run_id": run_id,
+            "permission_id": permission_id, "option_id": value.option_id}, actor)
+    return await native_permission(run_id, permission_id, value, actor)
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_route(run_id: str, actor: Principal = Depends(operator)):
+    if current().catalog:
+        return await current().catalog.control("cancel", {"run_id": run_id}, actor)
+    return await cancel(run_id, actor)
+
+
+@router.post("/runs/{run_id}/steps/{node_id}/approve")
+async def approve_route(run_id: str, node_id: str, decision: Decision, actor: Principal = Depends(operator)):
+    if current().catalog:
+        return await current().catalog.control("approve", {"run_id": run_id,
+            "node_id": node_id, "approved": decision.approved}, actor)
+    return await approve(run_id, node_id, decision, actor)
+
+
+@router.post("/runs/{run_id}/steps/{node_id}/resolve")
+async def resolve_step_route(run_id: str, node_id: str, resolution: Resolution,
+    actor: Principal = Depends(operator)):
+    require_admin(actor)
+    if current().catalog:
+        return await current().catalog.control("resolve", {"run_id": run_id,
+            "node_id": node_id, **resolution.model_dump()}, actor)
+    return await resolve_step(run_id, node_id, resolution, actor)
 
 
 @router.get("/sessions")
@@ -173,7 +248,7 @@ class SecretInput(BaseModel):
 @router.get("/credentials")
 async def credentials(actor: Principal = Depends(reader)):
     return [
-        {"id": r.id, "name": r.document["name"]}
+        {"id": r.id, "name": r.document["name"], "kind": r.document.get("kind", "api_key")}
         for r in current().store.list_resources(actor, "credential")
         if r.owner == actor.subject
     ]
@@ -181,10 +256,9 @@ async def credentials(actor: Principal = Depends(reader)):
 
 @router.post("/credentials", status_code=201)
 async def credential(value: SecretInput, actor: Principal = Depends(operator)):
-    from mcpgateway.utils.services_auth import encode_auth
-
     row = current().store.save(
-        "credential", {"name": value.name, "encrypted": encode_auth({"token": value.token})}, actor
+        "credential", {"name": value.name, "kind": "api_key",
+            "encrypted": await current().backend.encrypt_secret({"token": value.token})}, actor
     )
     return {"id": row.id, "name": value.name}  # Never expose ciphertext or plaintext.
 
@@ -221,7 +295,7 @@ async def upload(value: Upload, actor: Principal = Depends(operator)):
 
 @router.get("/artifacts/{artifact_id}")
 async def artifact(artifact_id: str, actor: Principal = Depends(reader)):
-    row = current().store.resource(artifact_id, actor, "artifact")
+    row = await current().resource(artifact_id, actor, "artifact")
     path = Path(os.environ.get("AOG_ARTIFACT_ROOT", "data/artifacts")) / row.document["key"]
     return {"name": row.document["name"], "content_base64": base64.b64encode(path.read_bytes()).decode()}
 
@@ -230,7 +304,8 @@ async def artifact(artifact_id: str, actor: Principal = Depends(reader)):
 async def resources(
     collection: Literal["services", "agents", "workflows"], actor: Principal = Depends(reader)
 ):
-    rows = current().store.list_resources(actor, KINDS[collection][0])
+    rows = (await current().catalog.list_resources(actor) if collection == "services" and current().catalog
+        else current().store.list_resources(actor, KINDS[collection][0]))
     result = []
     for row in rows:
         item = resource_view(row)
@@ -242,14 +317,21 @@ async def resources(
 
 async def save_resource(collection, document, actor, rid=None):
     kind, model = KINDS[collection]
+    if kind == "service" and current().catalog:
+        try:
+            return resource_view(await current().catalog.save(document, actor, rid))
+        except ValidationError as exc:
+            raise HTTPException(422, json.loads(exc.json(include_input=False))) from None
+    if kind == "agent" and document.get("schema_version") == 2:
+        model = AgentProfile
     if kind == "service":
         require_admin(actor)
     try:
         parsed = model.model_validate(document)
     except ValidationError as exc:
         raise HTTPException(422, json.loads(exc.json(include_input=False))) from None
-    if kind == "agent":
-        srv = current().store.resource(parsed.service_id, actor, "service")
+    if kind == "agent" and parsed.schema_version == 1:
+        srv = await current().resource(parsed.service_id, actor, "service")
         if srv.document["kind"] != "agent":
             raise HTTPException(422, "Agent requires an agent service")
         if parsed.project_id is None:
@@ -257,12 +339,29 @@ async def save_resource(collection, document, actor, rid=None):
         if parsed.project_id != srv.project_id:
             raise HTTPException(422, "Agent project must match its worker service")
         for service_id in parsed.allowed_service_ids:
-            current().store.resource(service_id, actor, "service")
+            await current().resource(service_id, actor, "service")
         if parsed.credential_ref:
-            secret = current().store.resource(parsed.credential_ref, actor, "credential")
+            secret = await current().resource(parsed.credential_ref, actor, "credential")
             if secret.owner != actor.subject:
                 raise HTTPException(403, "Personal credential belongs to another user")
-    return resource_view(current().store.save(kind, parsed.model_dump(), actor, rid))
+    if kind == "agent" and parsed.schema_version == 2:
+        runtime = current().store.resource(parsed.runtime_id, actor, "runtime")
+        if parsed.project_id is None:
+            parsed.project_id = runtime.project_id
+        if parsed.project_id != runtime.project_id:
+            raise HTTPException(422, "Agent project must match its runtime")
+        for tool_id in parsed.allowed_tool_ids:
+            tool = await current().resource(tool_id, actor, "service")
+            if tool.project_id and tool.project_id != parsed.project_id:
+                raise HTTPException(422, "Agent tools must belong to its project")
+    if rid and current().catalog and kind in {"agent", "workflow"}:
+        previous = current().store.resource(rid, actor, kind, write=True)
+        if previous.project_id != parsed.project_id:
+            raise HTTPException(409, "Create a new resource to change its native gateway team")
+    row = current().store.save(kind, parsed.model_dump(), actor, rid)
+    if current().catalog and kind in {"agent", "workflow"}:
+        await current().catalog.publish_resource(row, actor)
+    return resource_view(row)
 
 
 @router.post("/{collection}", status_code=201)
@@ -291,8 +390,11 @@ async def export_resource(
     format: Literal["json", "yaml"] = "json",
     actor: Principal = Depends(reader),
 ):
-    row = current().store.resource(rid, actor, KINDS[collection][0])
+    row = await current().resource(rid, actor, KINDS[collection][0])
     value = {"kind": row.kind, "revision": row.revision, "definition": row.document}
+    if row.kind == "service" and current().catalog:
+        value["definition"] = {**row.document, "schema_version": 2,
+            "runtime_id": current().store.runtime_id(row.id)}
     if format == "yaml":
         import yaml
 
@@ -309,41 +411,25 @@ async def invoke_resource(
     request: Invocation,
     actor: Principal = Depends(operator),
 ):
-    return run_view(await current().submit(KINDS[collection][0], rid, request, actor))
+    application = current()
+    submit = application.catalog.submit if application.catalog else application.submit
+    return run_view(await submit(KINDS[collection][0], rid, request, actor))
 
 
 @router.post("/services/{rid}/operations/{operation}")
 async def operation(
     rid: str, operation: Literal["start", "stop", "update"], actor: Principal = Depends(operator)
 ):
-    require_admin(actor)
-    row = current().store.resource(rid, actor, "service")
-    service = Service.model_validate(row.document)
-    if not (service.stack_id or service.openshell):
-        raise HTTPException(409, "Service has no managed deployment")
-    if service.openshell and operation == "update":
-        raise HTTPException(409, "Provision and verify a replacement OpenShell sandbox before rebinding")
-    if not current().store.claim_stop(rid, 0, phase="updating"):
-        raise HTTPException(409, "Service is busy; wait for active jobs to drain")
-    current().store.audit(actor.subject, f"service.{operation}", rid)
-    try:
-        await current().lifecycle.control(service, operation)
-        if operation != "stop" and service.health_url:
-            await current().lifecycle.health(service.health_url, service.timeout_seconds)
-        current().store.phase(rid, "stopped" if operation == "stop" else "running")
-    except Exception:
-        current().store.phase(rid, "error")
-        raise HTTPException(
-            502, "Deployment needs operator attention; inspect the configured runtime backend"
-        ) from None
-    return {"phase": current().store.phase(rid)}
+    from aog.management import runtime_operation
+    row = await current().resource(rid, actor, "service")
+    return await runtime_operation(current().store.runtime_id(row.id), operation, actor)
 
 
 @router.post("/services/{rid}/releases/{release}/deploy")
 async def deploy_release(rid: str, release: str, actor: Principal = Depends(operator)):
-    require_admin(actor)
-    row = current().store.resource(rid, actor, "service")
-    return await current().lifecycle.deploy_release(row, release, actor)
+    from aog.management import deploy_runtime_release
+    row = await current().resource(rid, actor, "service")
+    return await deploy_runtime_release(current().store.runtime_id(row.id), release, actor)
 
 
 class RuntimeResolution(BaseModel):
@@ -353,34 +439,17 @@ class RuntimeResolution(BaseModel):
 
 @router.post("/services/{rid}/reconcile")
 async def reconcile_runtime(rid: str, resolution: RuntimeResolution, actor: Principal = Depends(operator)):
-    require_admin(actor)
-    row = current().store.resource(rid, actor, "service")
-    service = Service.model_validate(row.document)
-    if service.openshell:
-        try:
-            remote = await current().lifecycle.control(service, "status")
-        except Exception:
-            raise HTTPException(502, "Cannot verify OpenShell sandbox") from None
-        expected = "SANDBOX_PHASE_READY" if resolution.phase == "running" else "SANDBOX_PHASE_STOPPED"
-        if remote["phase"] != expected:
-            raise HTTPException(409, "OpenShell state does not match the reconciliation")
-    if resolution.phase == "running":
-        if not service.health_url:
-            raise HTTPException(422, "A readiness URL is required to reconcile a running service")
-        await current().lifecycle.health(service.health_url, service.timeout_seconds)
-    with current().store.tx() as db:
-        db.execute(update(Runtime).where(Runtime.service_id == rid).values(last_used=Runtime.last_used))
-        if db.scalar(select(Lease.id).where(Lease.service_id == rid).limit(1)):
-            raise HTTPException(409, "Reconcile active executions before changing the runtime")
-        db.get(Runtime, rid).phase = resolution.phase
-    current().store.audit(actor.subject, "service.reconcile", rid, resolution.model_dump())
-    return {"phase": resolution.phase}
+    from aog.management import RuntimeResolution as TargetResolution
+    from aog.management import reconcile_runtime as reconcile_target
+    row = await current().resource(rid, actor, "service")
+    return await reconcile_target(current().store.runtime_id(row.id),
+        TargetResolution(**resolution.model_dump()), actor)
 
 
 @router.get("/services/{rid}/runtime")
 async def runtime_detail(rid: str, actor: Principal = Depends(reader)):
     require_admin(actor)
-    row = current().store.resource(rid, actor, "service")
+    row = await current().resource(rid, actor, "service")
     service = Service.model_validate(row.document)
     if not service.openshell:
         return {"backend": "komodo" if service.stack_id else "external", "phase": current().store.phase(rid)}

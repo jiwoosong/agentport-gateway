@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "key": "contextforge",
+  "version": "1.1.0",
+  "compatibility_revision": 1,
+  "source": {
+    "repository": "https://github.com/IBM/mcp-context-forge",
+    "commit": "aee91ff6db63b6aafa77522684a9483c418bb2a3",
+    "archive_url": "https://codeload.github.com/IBM/mcp-context-forge/tar.gz/aee91ff6db63b6aafa77522684a9483c418bb2a3",
+    "sha256": "1b7bf8f3c12621b7d2ac5a36263e0fc767c5b150965b0de8c5975c8e2a1633a5",
+    "license": "Apache-2.0"
+  },
+  "patch": {
+    "path": "patches/agentport-v1.1.0.patch",
+    "strip_components": 3,
+    "sha256": "f87a5d128ce98e15a35fb1222a8e4a8a9980fe00d8e6c1178595d5f95df82b43",
+    "license": "Apache-2.0"
+  },
+  "compatibility": {
+    "image": "agentport-contextforge:1.1.0-1",
+    "python": ">=3.12,<3.14",
+    "stock_plugin": false,
+    "purpose": "Optional compatibility image with explicit native authorization and local dispatch hooks"
+  }
+}

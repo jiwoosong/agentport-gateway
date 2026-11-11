@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Button } from "../../components/ui/button";
+import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { box, errorText, selectClass, type Entity, type Json, type Session } from "./shared";
 
@@ -17,12 +18,25 @@ export function InvokeForm({
   busy: boolean;
 }) {
   const properties = entity.input_schema?.properties;
-  const [values, setValues] = useState<Json>({});
+  const [values, setValues] = useState<Json>(() =>
+    Object.fromEntries(
+      Object.entries(properties || {})
+        .filter(([, spec]) => spec.default !== undefined)
+        .map(([name, spec]) => [name, spec.default]),
+    ),
+  );
+  const [pendingFiles, setPendingFiles] = useState(0);
   const [raw, setRaw] = useState('{"prompt": ""}');
   const [session, setSession] = useState("");
   const [local, setLocal] = useState(entity.local_only !== false);
   const [release, setRelease] = useState(false);
   const [error, setError] = useState("");
+  const requiredFilesReady = Object.entries(properties || {}).every(
+    ([name, spec]) =>
+      spec.contentEncoding !== "base64" ||
+      !entity.input_schema?.required?.includes(name) ||
+      (typeof values[name] === "string" && values[name].length > 0),
+  );
   return (
     <form
       className={box + " space-y-4"}
@@ -63,7 +77,48 @@ export function InvokeForm({
         Object.entries(properties).map(([name, spec]) => (
           <label key={name} className="block text-sm">
             {spec.title || name}
-            {spec.enum ? (
+            {spec.contentEncoding === "base64" ? (
+              <input
+                className="mt-2 block text-sm"
+                type="file"
+                accept="image/png,image/jpeg"
+                required={entity.input_schema?.required?.includes(name)}
+                onChange={async (e) => {
+                  const input = e.currentTarget;
+                  const file = input.files?.[0];
+                  setValues((current) =>
+                    Object.fromEntries(Object.entries(current).filter(([key]) => key !== name)),
+                  );
+                  if (!file) return;
+                  if (!["image/png", "image/jpeg"].includes(file.type)) {
+                    setError("Choose a PNG or JPEG image");
+                    return;
+                  }
+                  if (file.size > 20 * 1024 * 1024) {
+                    setError("Maximum image size is 20 MiB");
+                    return;
+                  }
+                  setError("");
+                  setPendingFiles((count) => count + 1);
+                  try {
+                    const encoded = await new Promise<string>((resolve, reject) => {
+                      const reader = new FileReader();
+                      reader.onload = () => resolve(String(reader.result).split(",")[1]);
+                      reader.onerror = () => reject(new Error("The image could not be read"));
+                      reader.readAsDataURL(file);
+                    });
+                    if (input.files?.[0] !== file) return;
+                    if (spec.maxLength && encoded.length > spec.maxLength)
+                      throw new Error("The image exceeds this tool's input limit");
+                    setValues((current) => ({ ...current, [name]: encoded }));
+                  } catch (err) {
+                    setError(errorText(err));
+                  } finally {
+                    setPendingFiles((count) => count - 1);
+                  }
+                }}
+              />
+            ) : spec.enum ? (
               <select
                 className={selectClass}
                 value={String(values[name] || "")}
@@ -81,6 +136,18 @@ export function InvokeForm({
                 type="checkbox"
                 checked={Boolean(values[name])}
                 onChange={(e) => setValues({ ...values, [name]: e.target.checked })}
+              />
+            ) : spec.type === "integer" || spec.type === "number" ? (
+              <Input
+                type="number"
+                min={spec.minimum}
+                max={spec.maximum}
+                step={spec.type === "integer" ? 1 : "any"}
+                required={entity.input_schema?.required?.includes(name)}
+                value={String(values[name] ?? "")}
+                onChange={(e) =>
+                  setValues((current) => ({ ...current, [name]: Number(e.target.value) }))
+                }
               />
             ) : (
               <Textarea
@@ -138,7 +205,7 @@ export function InvokeForm({
           >
             <option value="">New session</option>
             {sessions
-              .filter((s) => s.agent_id === entity.id)
+              .filter((s) => s.agent_id === entity.id && s.resume_supported !== false)
               .map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name} · {s.id.slice(0, 8)}
@@ -169,7 +236,7 @@ export function InvokeForm({
           {error}
         </p>
       )}
-      <Button disabled={busy}>Run</Button>
+      <Button disabled={busy || pendingFiles > 0 || !requiredFilesReady}>Run</Button>
     </form>
   );
 }
