@@ -4,14 +4,14 @@
 
 현재 구성은 Core와 gateway를 분리한 구조입니다. 아래 단일 앱 재구성·과거 측정 결과를 새 구성의 종단 간 검증으로 합산하지 않습니다.
 
-- Python 3.13.18 전체 회귀: **242 passed**, 38.54초. 두 프로세스 HTTP/MCP·두 사용자 격리·Core 강제 종료 복구·실제 ACP 테스트 프로세스·승인/취소/불명확 작업 정리·이전·설정 변경 잠금·서명 bridge·토큰 IP/시간/사용량 제한을 포함합니다. schema2의 Responses 연결·native 로그인과 빈 팀 범위의 비공개 Core 데이터 차단도 포함합니다. 모델 공급자의 유료 추론은 사용하지 않았습니다.
+- Python 3.13.18 전체 회귀: **242 passed**, 40.39초. 운영자 `.env`가 없는 임시 디렉터리에서도 통과했으며 테스트 전용 키는 매번 생성합니다. 두 프로세스 HTTP/MCP·두 사용자 격리·Core 강제 종료 복구·실제 ACP 테스트 프로세스·승인/취소/불명확 작업 정리·이전·설정 변경 잠금·서명 bridge·토큰 IP/시간/사용량 제한을 포함합니다. schema2의 Responses 연결·native 로그인과 빈 팀 범위의 비공개 Core 데이터 차단도 포함합니다. 모델 공급자의 유료 추론은 사용하지 않았습니다.
 - 준비 스크립트로 재현한 gateway의 선택 상류 회귀: **852 passed, 9 skipped**, 14.93초. RBAC·권한 축소·토큰 카탈로그·도구·bootstrap 대상입니다.
 - Core는 Python 3.13과 3.14 모두에서 upstream 소스와 `mcpgateway` 패키지가 없는 상태로 frozen 설치·앱 import를 통과했습니다. 설치된 다른 gateway entry point를 선택하는 검사도 포함합니다.
 - ContextForge가 설치되지 않은 Python 3.14 Core 환경의 선택 회귀는 **36 passed, 1 skipped**입니다.
 
 - BFF proxy/config 집중 검증: 41 passed. Core 전용 경로 분기·native API 유지·Bearer/CSRF·redirect·내부 header 차단. 전체 BFF 회귀는 26개 파일·291 tests passed, TypeScript build 통과.
 - Compose: demo/image-demo/managed/https 및 Core용 OpenShell override config 통과. 초기화의 private bridge key·.env0600·기존 값 보존과 Core에 native JWT/encryption master가 없는 구성도 확인.
-- 실제 Docker 실행은 이 환경의 daemon 접근 제한으로 별도 검증이 필요합니다. Compose config와 source preparation 검증은 container build/run과 구분합니다.
+- GitHub Actions Ubuntu amd64에서 분리된 Core·ContextForge connector·대시보드 이미지 빌드와 PostgreSQL·Redis 기동을 확인했습니다. 실제 로그인 → native 경유 작업 제출 → DBOS 실행 → BFF 사진 입력(1 MiB 초과 PNG) → WebP 결과 인출·해시·크기 검증이 Paperclip 없이 통과했습니다. [Compose 실행 기록](https://github.com/jiwoosong/agentport-gateway/actions/runs/42952018595/job/130298286353). 로컬 Docker daemon은 접근 제한이 있으며, 이 CI 결과가 DGX·GPU·Komodo 검증을 대신하지 않습니다.
 
 로컬 vLLM 검증은 운영자가 서비스 업데이트를 위해 중지한 상태여서 보류했습니다. 실기·공급자 추론·업데이트 복원을 이 자동 테스트 결과에 포함하지 않습니다. Python schema sandbox fork 및 상류 ToolPreInvokePayload header의 deprecation 경고가 남습니다.
 
@@ -85,8 +85,15 @@
 ```bash
 uv sync --frozen --extra dev
 uv run ruff check --config pyproject.toml src tests scripts examples
-uv run pytest -q
-AOG_INTEGRATION=1 uv run pytest tests/test_http_integration.py -q -s
+uv run --no-sync pytest -q tests/test_core*.py tests/test_worker.py tests/test_worker_jobs.py tests/test_contextforge_source.py
+```
+
+ContextForge 연결과 전체 서버 회귀는 Python 3.13 환경에서 실행합니다.
+
+```bash
+python scripts/prepare-contextforge.py
+uv sync --python 3.13 --frozen --extra contextforge --extra openshell --extra dev
+AOG_INTEGRATION=1 AOG_OPENSHELL_WIRE=1 uv run --no-sync pytest -q
 ```
 
 ```bash
