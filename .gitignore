@@ -1,6 +1,8 @@
 .tools/
 .cache/
 .venv/
+.venv-integration/
+.venv-core/
 .env
 .env.*
 !.env.example
@@ -25,3 +27,6 @@ logs/
 
 # Operator control-plane certificates and registry (never publish)
 openshell-secrets/
+
+# Prepared external gateway source; managed by scripts/prepare-contextforge.py
+/upstream/contextforge/

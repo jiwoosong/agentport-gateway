@@ -36,6 +36,7 @@ def layers(nodes: list[Node]) -> list[list[Node]]:
             raise ValueError(f"Target required: {node.id}")
         if node.type == "review" and not node.reviewer:
             raise ValueError("Review requires a reviewer agent")
+    by_id = {n.id: n for n in nodes}
     done: set[str] = set()
     result = []
     while len(done) < len(ids):
@@ -46,7 +47,6 @@ def layers(nodes: list[Node]) -> list[list[Node]]:
         for node in ready:
             ancestors = set(node.depends_on)
             todo = list(ancestors)
-            by_id = {n.id: n for n in nodes}
             while todo:
                 for dep in by_id[todo.pop()].depends_on:
                     if dep not in ancestors:

@@ -39,6 +39,8 @@ const fastify = Fastify({
   logger: { level: config.logLevel },
   logController: createRequestLogController(),
   trustProxy: config.trustProxy,
+  // A 20 MiB photo expands to ~27 MiB in the authenticated JSON tool form.
+  bodyLimit: 32 * 1024 * 1024,
 });
 
 await fastify.register(cookiePlugin);

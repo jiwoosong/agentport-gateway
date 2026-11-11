@@ -1,0 +1,36 @@
+"""Gateway integrations are installed components, not Core framework imports."""
+
+import os
+from functools import lru_cache
+from importlib.metadata import entry_points
+from typing import Protocol
+
+from fastapi import Request
+
+from aog.models import Principal
+
+
+class GatewayBackend(Protocol):
+    async def prepare(self): ...
+    async def capabilities(self): ...
+    async def migrate(self): ...
+    async def authenticate(self, request: Request) -> Principal: ...
+    async def authorize(self, actor: Principal, permission: str) -> Principal: ...
+    async def encrypt_secret(self, value): ...
+    async def decrypt_secret(self, value): ...
+    async def delegate(self, **arguments): ...
+    async def controls(self, actor: Principal, store): ...
+    async def worker_public_key(self): ...
+    def catalog(self, store): ...
+
+
+@lru_cache
+def get_backend() -> GatewayBackend:
+    name = os.environ.get("AOG_GATEWAY_BACKEND", "contextforge")
+    if name == "contextforge":
+        from aog.integrations.contextforge.client import ContextForgeBackend
+        return ContextForgeBackend()
+    matches = list(entry_points(group="agentport.gateway_backends", name=name))
+    if len(matches) != 1:
+        raise RuntimeError(f"Install exactly one trusted gateway integration named {name!r}")
+    return matches[0].load()()

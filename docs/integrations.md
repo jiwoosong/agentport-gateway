@@ -1,67 +1,65 @@
-# Hermes · NemoClaw · Paperclip 호환성
+# Integrations
 
-2026-11-10 소스 조사 기준입니다. **프로토콜 연결, 제품 실기 검증, 운영 수명주기 지원은 별도입니다.** 세 제품은 필수 의존성이 아니며 기본 Compose에 설치되지 않습니다.
+모델 API, 실행 하네스, 배포 runtime, 협업 제품은 서로 다른 대상입니다. 아래의 template은 구현된 연결 방식이며, 실제 계정·GPU·샌드박스에서의 종단 간 검증을 대신하지 않습니다. 제품 설치와 네이티브 로그인은 운영자가 준비합니다.
 
-| 제품 | AgentPort의 연결 경로 | 현재 검증 | 아직 제공하지 않는 기능 |
+## Harnesses and Model Providers
+
+| 대상 | 구현된 연결 | 인증·프로토콜 | 검증과 제한 |
 |---|---|---|---|
-| Hermes | 전용 ACP 워커 → `hermes-acp` → Hermes 네이티브 런타임 | 실행 프로필, 전용 HOME, 세션 재개, 중복 호출 억제의 모의 ACP 테스트 | 실제 모델 추론, 위임 MCP 도구가 있는 세션 재개, 원격 취소 전파 |
-| NemoClaw | 공식 `nemoclaw-acp --sandbox … --gateway …`로 관리형 Hermes 샌드박스 연결 가능 | 공식 소스의 연결 계약 확인; AgentPort 실행 프로필은 미구현 | 원격 작업 디렉터리/파일 전송, 중앙 수명주기 제어, 실기 검증; 모든 에이전트 지원 아님 |
-| Paperclip | 기존 JSON HTTP transport → 회사별 업무 API | 생성/조회 정의 파일 및 모의 HTTP 계약 테스트 | 업무 완료까지 자동 대기, 네이티브 run 취소/복구, SSO·사용자 자동 동기화 |
+| Codex | 전용 ACP 워커 → codex-acp 2.6.0 | ProviderConnection Responses 또는 operator native profile | 실제 초기 ACP 협상·모의 세션/job/승인. 유료 추론 미검증 |
+| Claude Code | 전용 ACP 워커 → claude-agent-acp 0.101.0 | ProviderConnection Messages 또는 native profile | 같은 범위. Responses/Chat Completions 자동 변환 없음 |
+| Hermes | 별도 설치한 hermes-acp | 전용 HERMES_HOME의 native provider/login | 모의 ACP·Relay 설정 검증. 위임 MCP가 있는 세션 재개는 409로 거부 |
+| Kimi Code | 별도 설치한 kimi acp | operator가 준비한 native profile | 실행 template·인증 경계 테스트. binary·계정 추론 미검증 |
+| OpenCode | 별도 설치한 opencode acp | 세 API 프로토콜별 native provider 설정 또는 native profile | v1.19.5 설정 계약·모의 프로세스 검증. binary·실제 provider 미검증 |
+| DeepSeek·OpenRouter·기타 모델 제공자 | 호환되는 하네스의 provider 또는 native 설정 | 해당 endpoint가 실제 지원하는 프로토콜·개인 API 키 | 제공자 이름만으로 tool calling·streaming·모델 지원을 보장하지 않음 |
 
-## Hermes 연결
+Codex의 OpenAI 계정 구독 로그인과 OpenAI API 키는 다른 인증입니다. Claude 구독 로그인과 Anthropic API 키도 별개입니다. native profile은 워커에 사전 설치한 전용 HOME의 opaque 참조이고 중앙에서 토큰·브라우저 인증을 자동 추출하지 않습니다.
 
-1. 운영자가 Hermes와 ACP 기능을 설치한 별도 워커 환경을 준비합니다. 기본 `deploy/worker.Dockerfile`은 Codex/Claude용이며 Hermes를 포함하지 않습니다. 검토한 소스 커밋은 아래 표에 있습니다. 설치된 `hermes-acp`가 워커 PATH에서 실행 가능해야 합니다.
-2. 기존 [ACP 워커 설정](deployment.md#acp-워커)의 소유자, 프로젝트, audience, 중앙 공개 키를 설정하고 `AOG_AGENT_PROVIDER=hermes`를 지정합니다. `uvicorn aog.worker:app --host 0.0.0.0 --port 8080`으로 워커를 실행합니다. 공개 인터넷에 워커를 직접 노출하지 않습니다.
-3. 워커 전용 `$AOG_WORKER_ROOT/home/.hermes`에 Hermes 프로필·모델 설정·인증을 준비합니다. 자식 프로세스의 `HERMES_HOME`은 이 경로로 고정됩니다. 호스트 전체 HOME이나 운영자 공용 프로필을 연결하지 않습니다. 프로필의 네이티브 도구·MCP·외부 통신 정책도 운영자가 제한해야 합니다.
-4. `kind=agent`, `transport=acp`, `endpoint=http://hermes-worker:8080/invoke`, `lifecycle=manual`로 서비스를 등록하고 해당 서비스에 에이전트 인스턴스를 연결합니다. timeout은 워커 실행 제한과 맞춥니다. 중앙 `credential_ref`는 비워 둡니다. Hermes는 여러 공급자를 지원하므로 중앙의 일반 Bearer 값을 임의의 공급자 API 키로 해석하지 않고 거부합니다.
-5. 신규 세션부터 검증합니다. 모델 선택은 Hermes가 제공하는 모델 ID를 사용합니다. MCP 도구가 없는 세션의 재개는 ACP `loadSession` 협상에 따릅니다. Hermes는 재개 시 기존 MCP 자격 증명의 fingerprint를 확인하지만 AgentPort는 위임 토큰을 갱신하므로, **위임 도구를 가진 Hermes 세션 재개는 현재 409로 거부**합니다. 세션을 새로 생성하거나 추후 안전한 토큰 갱신 계약을 구현해야 합니다.
+Chat Completions, Responses, Messages를 같은 JSON으로 취급하지 않습니다. 예를 들어 Chat Completions만 제공하는 모델 endpoint를 Codex Responses provider에 넣으면 호환되지 않습니다. OpenCode template은 프로토콜별 native AI SDK provider 설정을 생성하지만 upstream/model의 실제 도구·스트리밍 호환성은 별도로 확인해야 합니다. provider 등록 성공이 모델 호출 성공은 아닙니다.
 
-사용자·프로젝트·에이전트마다 전용 워커/프로필을 사용합니다. 중앙의 `allowed_service_ids`는 중앙 MCP 호출 범위이며 Hermes 자체 셸·플러그인 권한 전체를 제한하는 설정이 아닙니다. `isolated` 표시는 실제 네트워크 격리가 설치된 경우에만 사용합니다. 네이티브 런타임 종료와 ACP 클라이언트 종료도 동일하지 않습니다.
+[Worker Profiles](../workers/acp/README.md)에 인증 설정과 job 제어 경로가 있습니다. 기본 worker Dockerfile은 Codex·Claude ACP만 설치합니다. Hermes·Kimi·OpenCode는 해당 native binary가 들어간 별도 이미지를 만들어야 합니다. 중앙의 허용 도구 목록은 **중앙 MCP 호출**만 제한하고 하네스 자체의 셸·파일·플러그인 전체를 제어하지 않습니다.
 
-## NemoClaw 연결 범위
+## Service Connections
 
-검토한 버전에는 공식 `nemoclaw-acp`가 있습니다. 이 연결은 **등록된 관리형 Hermes 샌드박스**와 OpenShell/NemoClaw 버전·샌드박스 식별 정보를 검증합니다. 따라서 NemoClaw를 일반 OpenAI API나 임의의 Docker 컨테이너로 취급하지 않습니다. OpenClaw 등 다른 샌드박스 에이전트에도 동일한 ACP 경로가 있다고 가정하지 않습니다.
+HTTP·Streamable HTTP MCP endpoint를 제공하는 Docker 서비스는 정의 파일로 등록할 수 있습니다. 도구 입력·출력 스키마와 원격 readiness, 필요한 인증을 명시합니다. 같은 프로세스의 여러 기능은 같은 runtime_id를 사용합니다.
 
-AgentPort에 추가할 최소 범위는 다음과 같습니다.
+Docker image만 제공하는 CLI 프로젝트에는 HTTP/MCP wrapper가 필요합니다. 긴 작업에는 job ID·상태·취소·결과 계약이 추가로 필요합니다. 단순 POST 접수 성공을 백그라운드 작업 완료로 해석하지 않습니다. 이미지 변환 예제는 짧은 순수 함수이며, ACP worker는 별도의 영속 job 계약을 구현합니다.
 
-- 운영자가 고정한 gateway/sandbox를 선택하는 ACP 실행 프로필. 사용자의 임의 CLI 명령은 받지 않습니다.
-- 로컬 워커와 원격 샌드박스의 작업 디렉터리 매핑 및 명시적 파일 전송. 이 계약이 없으면 기존 workspace snapshot 기능을 거부해야 합니다.
-- OpenShell/NemoClaw 공식 인터페이스를 통한 상태 조회·시작·중지·복구. Komodo로 내부 컨테이너를 직접 종료하는 방식은 사용하지 않습니다.
-- 샌드박스의 네트워크 정책과 중앙 MCP 접근 범위를 함께 검증하고, 중단된 SSH/ACP 연결을 작업 종료의 증거로 간주하지 않습니다.
+RAG는 원본 문서 권한을 검색 단계에서 검증하는 서비스로 연결합니다. 도구 실행 권한만으로 모든 문서 접근을 허용하지 않습니다. 개인 메모리·스킬은 하네스에 두고 공유 게시 동작은 명시적인 별도 도구로 등록합니다.
 
-현재는 소스 호환성 조사까지이며 실행 프로필·배포 예제는 제공하지 않습니다. 운영자 홈/샌드박스 인증을 재사용하는 임시 우회 연결도 만들지 않았습니다. 실제 NemoClaw 설치 환경에서 위 항목을 검증한 뒤 지원 상태를 올립니다.
+## OpenShell and NeMo Relay
 
-## Paperclip 연결
+OpenShell 0.1.7은 선택 실행 backend입니다. 등록한 sandbox의 조회·시작·중지와 identity 일치를 검증합니다. 파일·네트워크 정책 적용은 실제 OpenShell 환경이 담당하며 AgentPort가 정책 편집·자동 설치를 제공하지는 않습니다. native 리소스 관리 권한은 operator의 OpenShell role/workspace 설정에 따라야 합니다.
 
-`examples/paperclip-issues-create.service.json`과 `paperclip-issues-list.service.json`은 기존 transport로 등록 가능한 예제입니다. 주소와 `REPLACE_COMPANY_ID`를 실제 회사 ID로 바꾸고, 개인 자격 증명에 해당 사용자의 Paperclip Board API 키를 저장하고, `REPLACE_CREDENTIAL_RESOURCE_ID`를 생성된 자격 증명 리소스 ID로 바꿉니다. 예제는 비공개이며 인증된 Paperclip 배포를 전제로 합니다. `local_trusted`를 여러 사용자용 권한 경계로 쓰지 않습니다.
+Relay는 관측·호출 미들웨어 기능을 제공하는 별도 프로젝트입니다. AgentPort에 구현된 연결은 **Hermes native Relay의 로컬 활동 요약**입니다. Relay enforcement, 중앙 단절 시 네트워크 차단, 모든 하네스의 trace, exactly-once/작업 완료 판정은 구현하지 않았습니다. [Runtime Platform](runtime-platform.md)을 참조하세요.
 
-- 생성: `POST /api/companies/{companyId}/issues`, 입력 `{"title":"모델 검수","description":"결과를 확인해주세요"}`. 반환된 issue는 **접수 결과**이며 작업 완료 결과가 아닙니다.
-- 조회: `GET /api/companies/{companyId}/issues`, 선택적 status 쿼리. 응답·검색 범위는 Paperclip API 키의 권한을 따릅니다.
-- AgentPort 로그인은 Paperclip UI 로그인으로 자동 이어지지 않습니다. 공용 관리자 API 키를 모든 사용자에게 공유하지 않습니다.
-- 중앙의 HTTP 호출 임대는 API 응답 시 끝납니다. 이후 Paperclip 업무나 heartbeat run은 계속될 수 있으므로 Paperclip에는 현재 `on_demand`/유휴 자동 종료를 사용하지 않습니다. 상시 운영 또는 운영자 관리 `manual`을 사용합니다.
-- issue/run ID를 저장하고 상태 조회·취소 확인·결과 회수까지 처리하는 전용 비동기 어댑터가 있어야 그래프의 “업무 완료” 노드로 사용할 수 있습니다. 현재 이를 구현했다고 주장하지 않습니다. 생성 요청의 응답이 유실되면 중복 생성 대신 확인 대상으로 남겨야 합니다. Idempotency-Key 헤더를 보낸다고 상류가 중복 제거를 보장하는 것은 아닙니다.
+## NemoClaw and OpenClaw
 
-## 연결 단절과 복구의 공통 경계
+두 제품은 기본 설치 대상이 아닙니다. NemoClaw 공식 ACP 연결은 검토한 버전에서 관리형 Hermes sandbox를 대상으로 하며 이를 모든 하네스의 공통 연결이라고 확대 해석하지 않습니다.
 
-현재 AgentPort는 불명확한 외부 실행을 무조건 재실행하지 않습니다. 그러나 중앙이 꺼졌을 때 세 제품의 새 외부 통신을 자동 차단하거나 원격 작업을 취소하는 기능은 없습니다. 이를 보장하려면 원격 실행 허가의 만료/갱신과 실제 네트워크 차단, 원격 작업 ID 기반 상태 대조를 함께 구현해야 합니다. 모델 API 타임아웃이나 컨테이너 정지만으로 정확한 중단·재개를 보장하지 않습니다.
+현재 AgentPort에는 NemoClaw 전용 launcher·파일 전송·리소스 소유권 조정 어댑터가 없습니다. OpenClaw 전용 계정/세션 어댑터도 없습니다. 각 제품이 제공하는 검증한 HTTP/MCP 기능은 일반 서비스로 등록할 수 있지만 제품 전체의 작업·세션·승인·취소를 지원한다는 뜻은 아닙니다.
 
-## 조사 기준과 출처
+전용 연동을 추가하려면 native job/session 식별자, 원격 작업공간 전송, 명확한 종료 확인, 사용자 인증 매핑을 정의해야 합니다. NemoClaw 소유 sandbox를 일반 OpenShell/Komodo backend로 우회 관리하지 않습니다. 운영자 공용 홈을 마운트하는 임시 연결도 사용자 격리의 대체가 아닙니다.
 
-상류 코드를 복사하거나 제품을 설치하지 않았습니다. 아래는 조사 기준 커밋이며 설치 잠금/실기 검증 버전이라는 뜻은 아닙니다.
+## Paperclip
 
-| 제품 | 소스 기준 | 사용한 계약 |
+Paperclip은 선택적인 별도 협업 제품입니다. 중지해도 AgentPort 로그인·다른 도구·자체 그래프는 작동합니다. [issue 생성](../examples/paperclip-issues-create.service.json)과 [issue 조회](../examples/paperclip-issues-list.service.json) 예제가 있습니다.
+
+실제 company ID·사설 주소·사용자 본인의 Board API credential 참조로 바꿉니다. AgentPort 로그인은 Paperclip 로그인을 자동 제공하지 않습니다. 여러 사용자의 호출에 공용 관리자 키를 쓰고 권한 분리가 완료됐다고 판단하지 않습니다.
+
+POST issue 응답은 **업무 접수 결과**입니다. Paperclip의 heartbeat·native run 완료를 기다리는 어댑터는 없습니다. HTTP 임대는 API 응답 후 끝나므로 Paperclip에는 manual/always_on을 사용합니다. 자체 업무가 있는 Paperclip 컨테이너를 AgentPort의 idle 판단으로 내리지 않습니다.
+
+Paperclip이 특정 하네스 어댑터를 제공해도 임의의 OpenShell 환경까지 자동 지원하는 것은 아닙니다. job 완료·취소·복구·결과를 그래프에 결합하려면 별도의 durable job bridge가 필요합니다. 응답 유실 후 issue 생성을 무조건 반복하지 않습니다.
+
+## Optional Products and References
+
+| 제품 | 소스 조사 기준 | 현재 사용 범위 |
 |---|---|---|
-| [Hermes](https://github.com/NousResearch/hermes-agent/tree/e790d946d8a62020c18ffcb37acab8d215ca386b) | `e790d946d8a62020c18ffcb37acab8d215ca386b` | `acp_adapter/entry.py`, `gateway_server.py`, `gateway_session_meta.py` |
-| [NemoClaw](https://github.com/NVIDIA/NemoClaw/tree/4d5d613f73b96d51a92e7ae88df5da5103836067) | `4d5d613f73b96d51a92e7ae88df5da5103836067` | `src/lib/acp/command.ts`, OpenShell Hermes ACP SSH transport, lifecycle 문서 |
-| [Paperclip](https://github.com/paperclipai/paperclip/tree/365c77103099c666b71fc8d4cc9ab0d4ef2081d6) | `365c77103099c666b71fc8d4cc9ab0d4ef2081d6` | `cli/src/commands/client/issue.ts`, `run.ts` |
+| [Hermes](https://github.com/NousResearch/hermes-agent/tree/e790d946d8a62020c18ffcb37acab8d215ca386b) | e790d946d8a62020c18ffcb37acab8d215ca386b | ACP/native profile·Relay 계약 참고. 소스 복사 없음 |
+| [NemoClaw](https://github.com/NVIDIA/NemoClaw/tree/4d5d613f73b96d51a92e7ae88df5da5103836067) | 4d5d613f73b96d51a92e7ae88df5da5103836067 | 호환성 조사. 전용 연결 미구현 |
+| [Paperclip](https://github.com/paperclipai/paperclip/tree/365c77103099c666b71fc8d4cc9ab0d4ef2081d6) | 365c77103099c666b71fc8d4cc9ab0d4ef2081d6 | 선택 JSON HTTP issue 예제 |
+| [OpenCode](https://github.com/anomalyco/opencode/tree/v1.19.5) | v1.19.5 | native provider/ACP 설정 계약. 기본 이미지에 미포함 |
+| [NeMo Relay](https://github.com/NVIDIA/NeMo-Relay/tree/dc00b939ae916266ce4f22ca080c9f13a40d4c48) | dc00b939ae916266ce4f22ca080c9f13a40d4c48 | Hermes 로컬 관측 설정 |
+| [Windmill](https://github.com/windmill-labs/windmill/tree/f9a797281218d331cc0898fbca87e155959f5ae0) | f9a797281218d331cc0898fbca87e155959f5ae0 | UX·운영 방식 참고. 코드 복사·실행 의존성 없음 |
 
-공식 문서: [Hermes ACP](https://hermes-agent.nousresearch.com/docs/user-guide/features/acp/), [NemoClaw](https://docs.nvidia.com/nemoclaw/latest/), [Paperclip 인증](https://docs.paperclip.ing/reference/api/authentication/).
-
-## 이번 변경의 검증 기록
-
-- `pytest -q tests/test_contracts.py tests/test_worker.py tests/test_integrations.py`: 20 passed.
-- 변경한 Python 파일의 Ruff 검사 및 포맷 검사 통과.
-- 앞선 제한 환경의 DBOS 테스트 중단은 후속 로컬 실행에서 재검증했습니다. 최신 결과는 [검증 기록](validation.md)을 참조하세요.
-- 세 제품을 실제 설치하거나 모델 API를 호출하지 않았습니다. Paperclip HTTP와 Hermes ACP는 모의 상대 프로세스/서버 계약 테스트입니다.
-
-OpenShell 독립 실행 백엔드와 Hermes Relay 관찰 지원은 [실행 플랫폼 개편](runtime-platform.md)을 참고하세요. NemoClaw 전용 관리 연동과는 별개입니다.
+이는 설치 잠금 또는 실기 검증 목록이 아닙니다. 실제 잠긴 의존성은 [Reuse and Compatibility](reuse-and-compatibility.md), 실행 결과는 [Validation](validation.md)에 기록합니다. 메신저 계정 연결은 현재 제공하지 않으며 웹·native MCP를 우선합니다.

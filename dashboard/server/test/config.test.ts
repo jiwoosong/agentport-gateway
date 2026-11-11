@@ -23,6 +23,7 @@ const ENV_KEYS = [
   "SSO_KEYCLOAK_CLIENT_SECRET",
   "SSO_LOGIN_STATE_TTL_SECONDS",
   "NODE_TLS_REJECT_UNAUTHORIZED",
+  "AGENTPORT_CORE_URL",
 ] as const;
 
 let savedEnv: Record<string, string | undefined>;
@@ -44,6 +45,14 @@ async function importConfig(): Promise<unknown> {
 }
 
 describe("config validation", () => {
+  it("rejects an unsafe Core origin before forwarding user bearer credentials", async () => {
+    process.env.COOKIE_SECURE = "false";
+    process.env.REDIS_URL = "memory://";
+    process.env.AGENTPORT_CORE_URL = "https://user:password@core.example";
+    const { resetModules, run } = await freshImport();
+    await expect(run()).rejects.toThrow("AGENTPORT_CORE_URL must use HTTP(S)");
+    resetModules();
+  });
   it("rejects REDIS_URL=memory:// in production", async () => {
     delete process.env.COOKIE_SECURE;
     process.env.NODE_ENV = "production";

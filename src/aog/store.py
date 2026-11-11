@@ -24,7 +24,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
-from aog.models import Principal
+from aog.models import AgentProfile, Principal, ProviderConnection, RuntimeDefinition, Service
 
 
 class Base(DeclarativeBase):
@@ -85,6 +85,25 @@ class SandboxBinding(Base):
     service_id: Mapped[str] = mapped_column(ForeignKey("aog_resources.id"), unique=True)
 
 
+class RuntimeBinding(Base):
+    __tablename__ = "aog_runtime_bindings"
+    # Native ContextForge tool IDs do not belong to aog_resources.
+    service_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    runtime_id: Mapped[str] = mapped_column(ForeignKey("aog_resources.id"), index=True)
+
+
+class RuntimeTarget(Base):
+    __tablename__ = "aog_runtime_targets"
+    target: Mapped[str] = mapped_column(String(64), primary_key=True)
+    runtime_id: Mapped[str] = mapped_column(ForeignKey("aog_resources.id"), unique=True)
+
+
+class SchemaMigration(Base):
+    __tablename__ = "aog_schema_migrations"
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+
 class Audit(Base):
     __tablename__ = "aog_audit"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
@@ -117,6 +136,77 @@ class Store:
                 db.execute(
                     text("UPDATE aog_runs SET cancel_requested = TRUE WHERE status = 'cancel_requested'")
                 )
+        with self.tx() as db:
+            if not db.get(SchemaMigration, 2):
+                targets = {}
+                for row in db.scalars(select(Resource).where(Resource.kind.in_(["service", "runtime"]))):
+                    target = self.target_identity(row.kind, row.document)
+                    if target:
+                        if target in targets:
+                            raise RuntimeError("Duplicate deployment targets require operator reconciliation before migration")
+                        targets[target] = row.id
+                        db.add(RuntimeTarget(target=target, runtime_id=row.id))
+                db.add(SchemaMigration(version=2))
+
+    @staticmethod
+    def target_identity(kind: str, document: dict) -> str | None:
+        target = document.get("openshell")
+        if target:
+            parts = ["openshell", target["gateway"], target["workspace"], target["sandbox"]]
+        elif kind == "runtime" and document.get("backend") == "komodo":
+            parts = ["komodo", document.get("backend_ref") or "default", document["target_id"]]
+        elif kind == "service" and document.get("stack_id"):
+            parts = ["komodo", "default", document["stack_id"]]
+        else:
+            return None
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+    def register_runtime(self, definition: RuntimeDefinition | dict, actor: Principal, rid: str | None = None):
+        document = RuntimeDefinition.model_validate(definition).model_dump()
+        return self.save("runtime", document, actor, rid)
+
+    def runtime_id(self, service_id: str) -> str:
+        with self.tx() as db:
+            binding = db.get(RuntimeBinding, service_id)
+            return binding.runtime_id if binding else service_id
+
+    def runtime_definition(self, service_id: str) -> RuntimeDefinition | None:
+        runtime_id = self.runtime_id(service_id)
+        with self.tx() as db:
+            row = db.get(Resource, runtime_id)
+            return RuntimeDefinition.model_validate(row.document) if row and row.kind == "runtime" else None
+
+    def service_projection(self, service_id: str, service: Service) -> Service:
+        definition = self.runtime_definition(service_id)
+        return definition.service_projection(service) if definition else service
+
+    def bind_runtime(self, service_id: str, runtime_id: str, actor: Principal, *, claimed_runtime_id: str | None = None):
+        if not actor.is_admin:
+            raise HTTPException(403, "Platform administrator required for runtime bindings")
+        self.resource(runtime_id, actor, "runtime")
+        old_id = self.runtime_id(service_id)
+        with self.tx() as db:
+            if claimed_runtime_id is not None:
+                if old_id != claimed_runtime_id:
+                    raise HTTPException(409, "Configuration claim no longer matches the runtime binding")
+                db.execute(update(Runtime).where(Runtime.service_id == old_id).values(last_used=Runtime.last_used))
+                old = db.get(Runtime, old_id)
+                if not old or old.phase != "updating" or db.scalar(select(Lease.id).where(Lease.service_id == old_id).limit(1)):
+                    raise HTTPException(409, "Configuration update requires its exclusive drained runtime claim")
+            elif old_id != runtime_id:
+                db.execute(update(Runtime).where(Runtime.service_id == old_id).values(last_used=time.time()))
+                old = db.get(Runtime, old_id)
+                if db.scalar(select(Lease.id).where(Lease.service_id == old_id).limit(1)):
+                    raise HTTPException(409, "Existing runtime has active leases")
+                if old and old.phase in {"starting", "stopping", "updating"}:
+                    raise HTTPException(409, "Existing runtime has an active deployment operation")
+            binding = db.get(RuntimeBinding, service_id)
+            if binding:
+                binding.runtime_id = runtime_id
+            else:
+                db.add(RuntimeBinding(service_id=service_id, runtime_id=runtime_id))
+            db.add(Audit(actor=actor.subject, action="runtime.bind", resource_id=service_id,
+                         detail={"runtime_id": runtime_id}))
 
     @contextmanager
     def tx(self):
@@ -147,24 +237,50 @@ class Store:
             ]
 
     def save(self, kind: str, document: dict, actor: Principal, rid: str | None = None, *, deployment=False):
+        if actor.public_only:
+            raise HTTPException(403, "Public-only tokens cannot manage private Core resources")
+        owner = self.resource(rid, actor, kind, write=True).owner if rid else actor.subject
+        if kind == "runtime":
+            if not actor.is_admin:
+                raise HTTPException(403, "Platform administrator required for runtime definitions")
+            document = RuntimeDefinition.model_validate(document).model_dump()
+        elif kind == "provider":
+            document = ProviderConnection.model_validate(document).model_dump()
+            credential = self.resource(document["credential_ref"], actor, "credential")
+            if credential.owner != owner:
+                raise HTTPException(403, "Provider credential belongs to another user")
+        elif kind == "agent" and document.get("schema_version") == 2:
+            document = AgentProfile.model_validate(document).model_dump()
+            self.resource(document["runtime_id"], actor, "runtime")
+            if document["provider_connection_id"]:
+                provider = self.resource(document["provider_connection_id"], actor, "provider")
+                if provider.owner != owner:
+                    raise HTTPException(403, "Provider connection belongs to another user")
+            else:
+                login = self.resource(document["native_login_ref"], actor, "credential")
+                if login.owner != owner:
+                    raise HTTPException(403, "Native login belongs to another user")
         project = document.get("project_id")
         if project and project not in actor.teams and not actor.is_admin:
             raise HTTPException(403, "Project membership required")
         if rid:
             self.resource(rid, actor, kind, write=True)
         with self.tx() as db:
-            if rid and kind == "service":
+            if rid and kind in {"service", "runtime"}:
+                runtime_id = self.runtime_id(rid)
                 db.execute(
-                    update(Runtime).where(Runtime.service_id == rid).values(last_used=Runtime.last_used)
+                    update(Runtime).where(Runtime.service_id == runtime_id).values(last_used=Runtime.last_used)
                 )
-                state = db.get(Runtime, rid)
-                if db.scalar(select(Lease.id).where(Lease.service_id == rid).limit(1)):
+                state = db.get(Runtime, runtime_id)
+                if db.scalar(select(Lease.id).where(Lease.service_id == runtime_id).limit(1)):
                     raise HTTPException(409, "Service has active leases")
                 if state.phase in {"starting", "stopping", "updating"} and not deployment:
                     raise HTTPException(409, "Service has an active deployment operation")
-                old_target = db.get(Resource, rid).document.get("openshell")
-                if old_target != document.get("openshell") and state.phase != "stopped":
-                    raise HTTPException(409, "Stop and reconcile the runtime before changing sandbox binding")
+                old = db.get(Resource, rid).document
+                target_changed = self.target_identity(kind, old) != self.target_identity(kind, document)
+                sandbox_changed = old.get("openshell") != document.get("openshell")
+                if (target_changed or sandbox_changed) and state.phase != "stopped" and not deployment:
+                    raise HTTPException(409, "Stop and reconcile the runtime before changing deployment binding")
             row = db.get(Resource, rid) if rid else None
             if row:
                 row.document = document
@@ -181,8 +297,20 @@ class Store:
                 )
                 db.add(row)
                 db.flush()
-                if kind == "service":
+                if kind in {"service", "runtime"}:
                     db.add(Runtime(service_id=row.id))
+            if kind in {"service", "runtime"}:
+                target_binding = db.scalar(select(RuntimeTarget).where(RuntimeTarget.runtime_id == row.id))
+                if target_binding:
+                    db.delete(target_binding)
+                    db.flush()
+                target_identity = self.target_identity(kind, document)
+                if target_identity:
+                    db.add(RuntimeTarget(target=target_identity, runtime_id=row.id))
+                    try:
+                        db.flush()
+                    except IntegrityError:
+                        raise HTTPException(409, "Deployment target is already registered") from None
             if kind == "service":
                 binding = db.scalar(select(SandboxBinding).where(SandboxBinding.service_id == row.id))
                 if binding:
@@ -209,7 +337,7 @@ class Store:
         with self.tx() as db:
             run = db.get(Run, run_id)
             # Runs are private even if their definition was shared.
-            if not run or (run.owner != actor.subject and not actor.is_admin):
+            if not run or not actor.sees(run.owner, run.project_id, "private"):
                 raise HTTPException(404, "Run not found")
             if (
                 actor.agent_id
@@ -223,22 +351,37 @@ class Store:
             return run
 
     def acquire(self, service_id: str, lease_id: str, run_id: str, capacity: int) -> bool:
+        runtime_id = self.runtime_id(service_id)
         with self.tx() as db:
             # UPDATE serializes with idle-stop and other acquisitions, including SQLite.
-            db.execute(update(Runtime).where(Runtime.service_id == service_id).values(last_used=time.time()))
-            state = db.get(Runtime, service_id)
+            db.execute(update(Runtime).where(Runtime.service_id == runtime_id).values(last_used=time.time()))
+            state = db.get(Runtime, runtime_id)
+            if state is None:
+                raise HTTPException(409, "Runtime is not registered")
+            binding = db.get(RuntimeBinding, service_id)
+            if (binding.runtime_id if binding else service_id) != runtime_id:
+                return False
             if state.phase in {"stopping", "updating", "error"}:
                 return False
-            if db.get(Lease, lease_id):
+            lease = db.get(Lease, lease_id)
+            if lease:
+                if lease.service_id != runtime_id or lease.run_id != run_id:
+                    raise HTTPException(409, "Lease ID already belongs to another execution")
                 return True
+            runtime = db.get(Resource, runtime_id)
+            if runtime and runtime.kind == "runtime":
+                definition = RuntimeDefinition.model_validate(runtime.document)
+                if not definition.enabled:
+                    raise HTTPException(403, "Runtime disabled")
+                capacity = definition.concurrency
             active = list(
                 db.scalars(
-                    select(Lease.id).where(Lease.service_id == service_id, ~Lease.id.like("session:%"))
+                    select(Lease.id).where(Lease.service_id == runtime_id, ~Lease.id.like("session:%"))
                 )
             )
             if len(active) >= capacity:
                 return False
-            db.add(Lease(id=lease_id, service_id=service_id, run_id=run_id))
+            db.add(Lease(id=lease_id, service_id=runtime_id, run_id=run_id))
             return True
 
     def release(self, lease_id: str):
@@ -253,30 +396,36 @@ class Store:
                 db.delete(lease)
 
     def claim_start(self, service_id: str):
+        runtime_id = self.runtime_id(service_id)
         with self.tx() as db:
             return (
                 db.execute(
                     update(Runtime)
-                    .where(Runtime.service_id == service_id, Runtime.phase == "stopped")
+                    .where(Runtime.service_id == runtime_id, Runtime.phase == "stopped")
                     .values(phase="starting")
                 ).rowcount
                 == 1
             )
 
     def phase(self, service_id: str, value: str | None = None):
+        runtime_id = self.runtime_id(service_id)
         with self.tx() as db:
             if value is not None:
-                db.execute(update(Runtime).where(Runtime.service_id == service_id).values(phase=value))
-            return db.get(Runtime, service_id).phase
+                db.execute(update(Runtime).where(Runtime.service_id == runtime_id).values(phase=value))
+            state = db.get(Runtime, runtime_id)
+            if state is None:
+                raise HTTPException(409, "Runtime is not registered")
+            return state.phase
 
     def claim_stop(self, service_id: str, idle_seconds: int, phase="stopping"):
+        runtime_id = self.runtime_id(service_id)
         with self.tx() as db:
-            busy = exists(select(Lease.id).where(Lease.service_id == service_id))
+            busy = exists(select(Lease.id).where(Lease.service_id == runtime_id))
             return (
                 db.execute(
                     update(Runtime)
                     .where(
-                        Runtime.service_id == service_id,
+                        Runtime.service_id == runtime_id,
                         ~busy,
                         Runtime.phase.in_(["running", "stopped"]),
                         Runtime.last_used <= time.time() - idle_seconds,

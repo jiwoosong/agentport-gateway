@@ -10,16 +10,28 @@ from aog.models import OpenShellTarget
 
 
 def connect(gateway: str):
-    from openshell import SandboxClient, TlsConfig
+    from openshell import ClientCredentialsAuth, SandboxClient, TlsConfig
 
     # This operator-mounted file is never accepted through an API or exported.
     config = json.loads(Path(os.environ["AOG_OPENSHELL_CONFIG"]).read_text())[gateway]
     tls = TlsConfig(
-        ca_path=Path(config["ca_path"]),
-        cert_path=Path(config["cert_path"]),
-        key_path=Path(config["key_path"]),
+        **{name: Path(config[name]) for name in ("ca_path", "cert_path", "key_path") if config.get(name)}
     )
-    return SandboxClient(config["endpoint"], tls=tls, timeout=30)
+    auth = {}
+    if config.get("bearer_token_env") and config.get("client_credentials"):
+        raise ValueError("Select one OpenShell bearer authentication method")
+    if config.get("bearer_token_env"):
+        # Native SDK calls the provider for every RPC, allowing operator-managed rotation.
+        auth["bearer_token"] = lambda: os.environ[config["bearer_token_env"]]
+    if credentials := config.get("client_credentials"):
+        auth["client_credentials"] = ClientCredentialsAuth(
+            issuer=credentials["issuer"],
+            client_id=credentials["client_id"],
+            client_secret=lambda: os.environ[credentials["client_secret_env"]],
+            audience=credentials.get("audience"),
+            scopes=credentials.get("scopes"),
+        )
+    return SandboxClient(config["endpoint"], tls=tls, timeout=30, **auth)
 
 
 class OpenShell:

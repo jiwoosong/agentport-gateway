@@ -14,6 +14,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 let upstream: Server;
 let upstreamOrigin: string;
+let core: Server;
+let coreOrigin: string;
+let lastCoreRequest: { path: string; authorization?: string; body: string; bridgeHeader?: string; proxyContext?: string };
 let lastRequest:
   { path: string; authorization: string | undefined; method: string; body: string } | undefined;
 
@@ -64,9 +67,36 @@ beforeAll(async () => {
   const { port } = upstream.address() as AddressInfo;
   upstreamOrigin = `http://127.0.0.1:${port}`;
   process.env.CONTEXTFORGE_URL = upstreamOrigin;
+  core = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      lastCoreRequest = {
+        path: req.url ?? "",
+        authorization: req.headers.authorization,
+        body: Buffer.concat(chunks).toString("utf8"),
+        bridgeHeader: req.headers["x-agentport-bridge"] as string | undefined,
+        proxyContext: req.headers["x-agentport-proxy-context"] as string | undefined,
+      };
+      if (req.url === "/orchestration/v1/redirect") {
+        res.writeHead(307, { location: `${coreOrigin}/orchestration/v1/services/` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ target: "core" }));
+    });
+  });
+  await new Promise<void>((resolve) => core.listen(0, "127.0.0.1", resolve));
+  coreOrigin = `http://127.0.0.1:${(core.address() as AddressInfo).port}`;
+  process.env.AGENTPORT_CORE_URL = coreOrigin;
 });
 
-afterAll(() => new Promise<void>((resolve) => upstream.close(() => resolve())));
+afterAll(async () => {
+  await Promise.all(
+    [upstream, core].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+  );
+});
 
 async function buildApp() {
   const { buildTestApp } = await import("./helpers/build-app.js");
@@ -97,6 +127,64 @@ async function seedSession(app: Awaited<ReturnType<typeof buildApp>>) {
 }
 
 describe("ALL /api/*", () => {
+  it("routes orchestration to Core while retaining the session bearer and native gateway routes", async () => {
+    const app = await buildApp();
+    const { cookie } = await seedSession(app);
+    const response = await app.fastify.inject({
+      method: "GET",
+      url: "/api/orchestration/v1/services?limit=3",
+      headers: { cookie },
+    });
+    expect(response.json()).toEqual({ target: "core" });
+    expect(lastCoreRequest.path).toBe("/orchestration/v1/services?limit=3");
+    expect(lastCoreRequest.authorization).toBe("Bearer test-bearer-token");
+    await app.fastify.inject({ method: "GET", url: "/api/tools", headers: { cookie } });
+    expect(lastRequest?.path).toBe("/tools");
+  });
+
+  it("keeps CSRF protection and strips forged internal bridge headers on Core requests", async () => {
+    const app = await buildApp();
+    const { cookie, csrfToken } = await seedSession(app);
+    const payload = { inputs: { image_base64: "AQID" } };
+    const denied = await app.fastify.inject({
+      method: "POST",
+      url: "/api/orchestration/v1/services/photo/invoke",
+      headers: { cookie },
+      payload,
+    });
+    expect(denied.statusCode).toBe(403);
+    const response = await app.fastify.inject({
+      method: "POST",
+      url: "/api/orchestration/v1/services/photo/invoke",
+      headers: {
+        cookie,
+        "x-csrf-token": csrfToken,
+        "x-agentport-bridge": "forged",
+        "x-agentport-proxy-context": "forged-context",
+        "x-agentport-proxy-signature": "forged-signature",
+        authorization: "Bearer forged",
+      },
+      payload,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(lastCoreRequest.body)).toEqual(payload);
+    expect(lastCoreRequest.authorization).toBe("Bearer test-bearer-token");
+    expect(lastCoreRequest.bridgeHeader).toBeUndefined();
+    expect(lastCoreRequest.proxyContext).toBeUndefined();
+  });
+
+  it("rewrites Core redirects behind the same BFF origin", async () => {
+    const app = await buildApp();
+    const { cookie } = await seedSession(app);
+    const response = await app.fastify.inject({
+      method: "GET",
+      url: "/api/orchestration/v1/redirect",
+      headers: { cookie },
+    });
+    expect(response.statusCode).toBe(307);
+    expect(response.headers.location).toBe("/api/orchestration/v1/services/");
+  });
+
   it("401s without a session cookie", async () => {
     const app = await buildApp();
     const response = await app.fastify.inject({ method: "GET", url: "/api/tools" });

@@ -3,6 +3,19 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.14"}
+      - run: pip install uv==0.13.7
+      - run: uv sync --frozen --extra dev
+      - name: Prove Core installs without external gateway source or package
+        run: |
+          test ! -e upstream/contextforge
+          uv run --no-sync python -c 'import importlib.util; assert importlib.util.find_spec("mcpgateway") is None; import aog.app, aog.worker'
+      - run: uv run --no-sync pytest -q tests/test_core*.py tests/test_worker.py tests/test_worker_jobs.py tests/test_contextforge_source.py
   gateway:
     runs-on: ubuntu-latest
     steps:
@@ -10,10 +23,19 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.13"}
       - run: pip install uv==0.13.7
-      - run: uv sync --frozen --extra dev --extra openshell
-      - run: uv run ruff check --config pyproject.toml src tests scripts examples
-      - run: AOG_OPENSHELL_WIRE=1 uv run --extra openshell pytest -q
-      - run: AOG_INTEGRATION=1 uv run pytest tests/test_http_integration.py -q
+      - run: python scripts/prepare-contextforge.py
+      - run: python scripts/prepare-contextforge.py
+      - run: uv sync --frozen --extra contextforge --extra dev --extra openshell
+      - run: uv run --no-sync ruff check --config pyproject.toml src tests scripts examples
+      - run: AOG_INTEGRATION=1 AOG_OPENSHELL_WIRE=1 uv run --no-sync pytest -q
+      - name: Native gateway regression tests
+        run: >-
+          uv run --no-sync pytest -q -o addopts=''
+          upstream/contextforge/tests/unit/mcpgateway/middleware/test_rbac.py
+          upstream/contextforge/tests/unit/mcpgateway/services/test_permission_service_token_narrowing.py
+          upstream/contextforge/tests/unit/mcpgateway/services/test_token_catalog_service.py
+          upstream/contextforge/tests/unit/mcpgateway/services/test_tool_service.py
+          upstream/contextforge/tests/unit/mcpgateway/test_bootstrap_db.py
   dashboard:
     runs-on: ubuntu-latest
     defaults:
@@ -36,10 +58,10 @@ jobs:
       - run: pip install httpx python-dotenv
       - run: python scripts/init-compose.py
       - run: python -c 'from pathlib import Path; p=Path(".env"); p.write_text(p.read_text()+"PASSWORD_CHANGE_ENFORCEMENT_ENABLED=false\n")'
-      - run: docker compose --profile demo config --quiet
-      - run: docker compose --profile demo up -d --build
+      - run: docker compose --profile demo --profile image-demo config --quiet
+      - run: docker compose --profile demo --profile image-demo up -d --build
       - run: python scripts/smoke-compose.py
       - if: failure()
-        run: docker compose logs --tail 80 gateway dashboard converter
+        run: docker compose logs --tail 80 gateway core dashboard converter image-converter
       - if: always()
-        run: docker compose --profile demo down -v
+        run: docker compose --profile demo --profile image-demo down -v

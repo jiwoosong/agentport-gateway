@@ -7,8 +7,8 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 values = {
     "JWT_SECRET_KEY": secrets.token_urlsafe(48),
+    "AOG_GATEWAY_BRIDGE_SECRET": secrets.token_urlsafe(48),
     "AUTH_ENCRYPTION_SECRET": secrets.token_urlsafe(48),
-    "AOG_DELEGATION_SECRET": secrets.token_urlsafe(48),
     "POSTGRES_PASSWORD": secrets.token_urlsafe(32),
     "KOMODO_JWT_SECRET": secrets.token_urlsafe(48),
     "PLATFORM_ADMIN_EMAIL": "admin@example.com",
@@ -23,6 +23,11 @@ values = {
     "EMAIL_AUTH_ENABLED": "true",
     "MCPGATEWAY_UI_ENABLED": "true",
     "MCPGATEWAY_ADMIN_API_ENABLED": "true",
+    "MCPGATEWAY_DIRECT_PROXY_ENABLED": "false",
+    "MCPGATEWAY_A2A_ENABLED": "false",
+    "LLM_API_ENABLED": "false",
+    "SSRF_ALLOW_PRIVATE_NETWORKS": "false",
+    "SSRF_ALLOWED_NETWORKS": '["172.30.71.0/24"]',
     "LOG_LEVEL": "ERROR",
 }
 path = root / ".env"
